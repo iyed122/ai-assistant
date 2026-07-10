@@ -71,9 +71,9 @@ Built and tested against a real enterprise corpus, not a toy dataset:
 |---|---|
 | ![Inference](docs/images/home.png) | ![Hammer status](docs/images/hammer_status.png) |
 
-| Knowledge graph | QLoRA training | MLflow runs |
+| DPO | QLoRA training | MLflow runs |
 |---|---|---|
-| ![Graph](assets/graph_stats.png) | ![Training](assets/training_run.png) | ![MLflow](assets/mlflow_runs.png) |
+| ![Graph](docs/images/DPO.png) | ![Training](docs/images/qlora_training.png) | ![MLflow](docs/images/mlruns.png) |
 
 ## Engineering rigor
 
