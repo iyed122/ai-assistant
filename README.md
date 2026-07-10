@@ -69,7 +69,7 @@ Built and tested against a real enterprise corpus, not a toy dataset:
 
 | Inference (CLI, per-node timing) | Evaluation loop |
 |---|---|
-| ![Inference](assets/inference_cli.png) | ![Hammer status](assets/hammer_status.png) |
+| ![Inference](docs/imagess/home.png) | ![Hammer status](home/images/hammer_status.png) |
 
 | Knowledge graph | QLoRA training | MLflow runs |
 |---|---|---|
