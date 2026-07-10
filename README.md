@@ -79,9 +79,6 @@ Built and tested against a real enterprise corpus, not a toy dataset:
 
 The full stack went through three documented optimization rounds with A/B verification before reaching this state — including fixes verified by automated checks: a prompt-overflow bug (12.6k tokens silently truncated against a 10.2k window → now budgeted), API fan-out cut 40→12 calls on broad queries, evaluation mislabeling that poisoned training data (dead query-echo exemptions, narrow key regexes), training prompts that had drifted from inference prompts, and a model-promotion loop that could never ship. The complete diagnoses live in:
 
-- [`rag/DIAGNOSIS.md`](rag/DIAGNOSIS.md) — retrieval & generation layer
-- [`AGENT_SENTRIES_DIAGNOSIS.md`](AGENT_SENTRIES_DIAGNOSIS.md) — agent, routing, weaver
-- [`HAMMER_TRAINING_DIAGNOSIS.md`](HAMMER_TRAINING_DIAGNOSIS.md) — evaluation & training pipeline
 
 ## Stack
 
