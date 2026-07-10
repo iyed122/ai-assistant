@@ -73,7 +73,7 @@ Built and tested against a real enterprise corpus, not a toy dataset:
 
 | DPO | QLoRA training | MLflow runs |
 |---|---|---|
-| ![Graph](docs/images/DPO.png) | ![Training](docs/images/qlora_training.png) | ![MLflow](docs/images/mlruns.png) |
+| ![DPO](docs/images/dpo.png) | ![Training](docs/images/qlora_training.png) | ![MLflow](docs/images/mlruns.png) |
 
 ## Engineering rigor
 
