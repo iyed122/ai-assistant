@@ -1,0 +1,16 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# CPU-only override — for machines WITHOUT an NVIDIA GPU.
+#
+# The default stack (docker-compose.yml) reserves an NVIDIA GPU for the backend.
+# On a machine without one, `docker compose up` fails. This override removes that
+# reservation so the stack runs anywhere. The image still contains CUDA torch; it
+# simply falls back to CPU when no GPU is present (embedding/rerank run slower).
+#
+#   Usage:
+#     docker compose -f docker-compose.yml -f docker-compose.cpu.yml up -d
+#
+# Requires Docker Compose v2.24.4+ (for the !reset tag).
+# ─────────────────────────────────────────────────────────────────────────────
+services:
+  backend:
+    deploy: !reset null

@@ -1,6 +1,6 @@
 # All versions pinned to exact matches from the working local venv.
-# torch (2.5.1+cpu) is installed in a separate Dockerfile RUN step BEFORE this
-# file to prevent pip from later pulling the CUDA torch as a transitive dep.
+# torch (2.5.1+cu121) is installed in a separate Dockerfile RUN step BEFORE this
+# file so pip never re-resolves it as a transitive dependency.
 
 # ── Web framework ──────────────────────────────────────────────────────────────
 fastapi==0.135.1
@@ -30,7 +30,7 @@ langgraph==1.2.0
 # ── Embeddings ─────────────────────────────────────────────────────────────────
 # sentence-transformers 5.x was developed against torch 2.5.x.
 # torch itself is NOT listed here — it is pre-installed in Dockerfile step 1
-# (torch==2.5.1+cpu) so pip never touches it when processing this file.
+# (torch==2.5.1+cu121) so pip never touches it when processing this file.
 sentence-transformers==5.2.3
 transformers==4.46.3
 huggingface-hub==0.36.2

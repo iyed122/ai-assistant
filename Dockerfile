@@ -6,12 +6,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# ── Step 1: Install CPU-only PyTorch BEFORE requirements ───────────────────────
-# Pinned to 2.5.1+cpu — same major.minor as the working local venv (2.5.1+cu121),
-# just without CUDA. sentence-transformers 5.2.3 was built against 2.5.x and
-# uses APIs that don't exist in older torch releases.
-# Must come BEFORE requirements.docker.txt so pip sees torch as already satisfied
-# and never pulls the CUDA wheel (~2.5 GB) as a transitive dependency.
+# ── Step 1: Install CUDA PyTorch BEFORE requirements ───────────────────────────
+# Pinned to 2.5.1+cu121 to match the working local venv. sentence-transformers
+# 5.2.3 was built against torch 2.5.x and uses APIs absent from older releases.
+# Installed BEFORE requirements.docker.txt so pip sees torch as already satisfied
+# and never re-resolves it as a transitive dependency.
+# No NVIDIA GPU? This wheel still runs (falls back to CPU); start the stack with
+# docker-compose.cpu.yml so compose doesn't require a GPU device.
 RUN pip install --no-cache-dir \
     torch==2.5.1+cu121 \
     --index-url https://download.pytorch.org/whl/cu121

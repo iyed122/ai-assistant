@@ -82,9 +82,14 @@ def _sse(data: dict) -> str:
 # ── App setup ─────────────────────────────────────────────────────────────────
 app = FastAPI(title="AI Assistant API", version="1.1.0")
 
+# CORS origins are env-driven so the same image works behind any host/domain.
+# Defaults to the local dev frontends (React :3000, Vite :5173).
+_cors_default = "http://localhost:3000,http://localhost:5173"
+_cors_origins = [o.strip() for o in os.getenv("CORS_ORIGINS", _cors_default).split(",") if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:5173"],
+    allow_origins=_cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

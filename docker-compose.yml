@@ -8,13 +8,22 @@ services:
       - "7474:7474"   # browser UI
       - "7687:7687"   # bolt
     environment:
-      # Set NEO4J_PASSWORD in .env (compose reads it automatically)
+      # Password comes from .env — compose reads it automatically.
       NEO4J_AUTH: "neo4j/${NEO4J_PASSWORD:?set NEO4J_PASSWORD in .env}"
       NEO4J_PLUGINS: '["apoc"]'
       NEO4J_server_memory_heap_initial__size: "512m"
       NEO4J_server_memory_heap_max__size: "1g"
     volumes:
-      - neo4j_data:/data
+      # Fresh isolated named volume by default. Point NEO4J_DATA_PATH at an
+      # existing Neo4j data dir in .env to reuse your own graph + embeddings.
+      - ${NEO4J_DATA_PATH:-neo4j_data}:/data
+    healthcheck:
+      # Wait until Bolt actually accepts queries, not just until the container starts.
+      test: ["CMD-SHELL", "cypher-shell -u neo4j -p '${NEO4J_PASSWORD}' 'RETURN 1' >/dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 40s
     restart: unless-stopped
     networks: [ai_net]
 
@@ -41,20 +50,24 @@ services:
     environment:
       - NEO4J_URI=bolt://neo4j:7687
       - MONGO_URI=${MONGO_URI_DOCKER:-mongodb://mongo:27017/}
-      # Ollama stays on the host for GPU access; install + `ollama serve` there.
+      # Ollama runs on the host for GPU access; install it + `ollama serve` there.
       - OLLAMA_HOST=${OLLAMA_HOST_DOCKER:-http://host.docker.internal:11434}
       - PYTHONUNBUFFERED=1
       - MLFLOW_TRACKING_URI=sqlite:////app/mlflow.db
     volumes:
       - hf_cache:/root/.cache/huggingface
       - ./mlruns:/app/mlruns
-    depends_on: [neo4j, mongo]
+    depends_on:
+      neo4j:
+        condition: service_healthy
+      mongo:
+        condition: service_started
     restart: unless-stopped
     extra_hosts:
       - "host.docker.internal:host-gateway"
     networks: [ai_net]
-    # Optional NVIDIA GPU for in-container embedding/rerank. Remove this block
-    # (or run `docker compose up` without it) on CPU-only machines.
+    # Optional NVIDIA GPU for in-container embedding/rerank. On a CPU-only host,
+    # remove this block (or add a docker-compose.cpu.yml override) to start the stack.
     deploy:
       resources:
         reservations:

@@ -104,7 +104,7 @@ ollama serve && ollama pull qwen3:8b   # Ollama runs on the host (GPU)
 docker compose up -d --build
 ```
 
-That starts **Neo4j 5 + APOC** (browser: `:7474`), **MongoDB**, the **FastAPI backend** (`:8000`), and the **React frontend** (`:3000`). On CPU-only machines, remove the `deploy:` GPU block from `docker-compose.yml`. Then load your data: `docker compose exec backend python -m rag.neo4j_import`.
+That starts **Neo4j 5 + APOC** (browser: `:7474`), **MongoDB**, the **FastAPI backend** (`:8000`), and the **React frontend** (`:3000`). On CPU-only machines (no NVIDIA GPU), add the CPU override instead: `docker compose -f docker-compose.yml -f docker-compose.cpu.yml up -d --build`. Then load your data: `docker compose exec backend python -m rag.neo4j_import`.
 
 ## Quickstart (bare metal)
 
