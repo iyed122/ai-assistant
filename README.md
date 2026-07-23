@@ -15,7 +15,7 @@ Ingestion builds the knowledge graph; the LangGraph agent answers from graph ret
 - **Hybrid retrieval**: embedding ANN over chunk vectors stored in Neo4j, expanded through typed Jira link edges (BLOCKS, RELATES_TO, CHILD_OF, …) and the Confluence page hierarchy, then reranked with a cross-encoder. Questions naming a ticket key bypass search entirely with a direct indexed graph fetch.
 - **Deterministic routing**: a keyword/regex intent classifier (no LLM latency on the hot path) with an optional LLM fallback; ~30 routing rules map natural language to concrete API calls (JQL, CQL, GitLab REST) with conversation context carry-over and per-project fan-out caps.
 - **Context-budgeted generation**: every prompt section (knowledge base, live data, history) has an enforced budget so the model window can never silently overflow.
-- **Self-improving loop**: every answer is scored (RAGAS faithfulness/relevance where applicable, a zero-LLM validator for live-data answers), graded GOLD/SILVER/BRONZE/FAILED with orthogonal failure tags, exported to QLoRA/DPO/GRPO datasets, and fine-tuned adapters must pass a benchmark gate (score delta + per-intent faithfulness floors) before promotion via MLflow.
+- **Self-improving loop**: every answer is scored (RAGAS faithfulness/relevance where applicable, a zero-LLM validator for live-data answers), graded GOLD/SILVER/BRONZE/FAILED with orthogonal failure tags, exported to QLoRA/DPO datasets, and fine-tuned adapters must pass a benchmark gate (score delta + per-intent faithfulness floors) before promotion via MLflow.
 - **Bilingual**: English and French queries throughout the routing and prompting layers.
 
 ## Why it matters (business value)
@@ -35,10 +35,10 @@ Built and tested against a real enterprise corpus, not a toy dataset:
 |---|---|
 | Embedded corpus | **~24 GB** of pre-embedded chunks (20 GB Jira + 3.7 GB Confluence JSONL) |
 | Jira issues represented | ~424,000 across dozens of projects |
-| Chunk nodes in Neo4j (768-dim vectors) | _run `python -m rag.neo4j_search stats` →_ `N` |
-| Graph relationships (PART_OF, BLOCKS, RELATES_TO, CHILD_OF, …) | `N` |
+| Chunk nodes in Neo4j (768-dim vectors) | **~1.28M** |
+| Graph relationships (PART_OF, BLOCKS, RELATES_TO, CHILD_OF, …) | **~1.46M** |
 | Typed Jira link relationship types modeled | 20+ (BLOCKS, CAUSES, DUPLICATES, IMPLEMENTS, SPLIT_FROM, …) |
-| Production answers scored by the eval loop | `N` (`python -m hammer.run_hammer status`) |
+| Production answers scored by the eval loop | grows with every session — track via `python -m hammer.run_hammer status` |
 | Fine-tuning hardware | single RTX 3050 (6 GB) — QLoRA 4-bit + gradient checkpointing |
 
 ## Screenshots
@@ -112,7 +112,7 @@ All tunables (retrieval depth, rerank pool, context budgets, fan-out caps, eval 
 
 ```bash
 python -m hammer.run_hammer score            # score new chat turns
-python -m hammer.run_hammer dataset all      # export QLoRA / DPO / GRPO sets
+python -m hammer.run_hammer dataset all      # export QLoRA / DPO sets
 python training/pipeline.py check-compat     # adapter ↔ serving model guard
 python training/pipeline.py prepare && python training/pipeline.py train --method qlora
 python -m hammer.run_hammer benchmark datasets/eval_set.jsonl --version my-lora-v1
