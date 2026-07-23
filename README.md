@@ -6,33 +6,9 @@ Everything runs locally: Neo4j, MongoDB, Ollama, and QLoRA/DPO fine-tuning sized
 
 ## Architecture
 
-```
-                          ┌─────────────────┐
-        user question ───►│ intent classifier│  rag | sentries | both
-                          └────────┬────────┘
-              ┌────────────────────┼────────────────────┐
-              ▼                                         ▼
-   ┌─────────────────────┐                 ┌─────────────────────────┐
-   │  RAG (Neo4j)        │                 │  Sentries (live APIs)   │
-   │  vector ANN          │                 │  GitLab · Jira ·        │
-   │  + multi-hop graph   │                 │  Confluence, parallel   │
-   │  + cross-encoder     │                 │  dispatch, fan-out caps │
-   │    rerank            │                 └───────────┬─────────────┘
-   └──────────┬───────────┘                             │
-              └──────────────────┬──────────────────────┘
-                                 ▼
-                       ┌──────────────────┐
-                       │  Weaver (Ollama) │  budgeted context, streaming
-                       └────────┬─────────┘
-                                ▼
-                          final answer
-                                │
-                                ▼
-                  ┌───────────────────────────┐
-                  │  Hammer (async eval loop) │  RAGAS + deterministic
-                  │  grade → dataset → gate   │  validator → QLoRA/DPO
-                  └───────────────────────────┘
-```
+![AI Assistant architecture](docs/images/architecture.png)
+
+Ingestion builds the knowledge graph; the LangGraph agent answers from graph retrieval **and** the live APIs; every answer is scored by Hammer and mined into training data; QLoRA/DPO runs are tracked and versioned in MLflow; and the fine-tuned adapter is pushed back onto the served Ollama model — a closed, self-improving loop.
 
 ## Highlights
 
@@ -77,8 +53,7 @@ Built and tested against a real enterprise corpus, not a toy dataset:
 
 ## Engineering rigor
 
-The full stack went through three documented optimization rounds with A/B verification before reaching this state — including fixes verified by automated checks: a prompt-overflow bug (12.6k tokens silently truncated against a 10.2k window → now budgeted), API fan-out cut 40→12 calls on broad queries, evaluation mislabeling that poisoned training data (dead query-echo exemptions, narrow key regexes), training prompts that had drifted from inference prompts, and a model-promotion loop that could never ship. The complete diagnoses live in:
-
+The full stack went through three documented optimization rounds with A/B verification before reaching this state — including fixes verified by automated checks: a prompt-overflow bug (12.6k tokens silently truncated against a 10.2k window → now budgeted), API fan-out cut 40→12 calls on broad queries, evaluation mislabeling that poisoned training data (dead query-echo exemptions, narrow key regexes), training prompts that had drifted from inference prompts, and a model-promotion loop that could never ship.
 
 ## Stack
 

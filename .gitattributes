@@ -1,0 +1,10 @@
+# Treat these as binary: never apply line-ending conversion or text diffing.
+# (Without this, core.autocrlf=true would corrupt committed PDFs/images.)
+*.pdf   binary
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.ico   binary
+*.woff  binary
+*.woff2 binary

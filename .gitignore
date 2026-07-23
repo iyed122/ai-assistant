@@ -36,6 +36,8 @@ frontend/.next/
 
 # ── Local reports & office docs (internal references — kept off GitHub) ──
 *.pdf
+# published user guide — kept in-repo
+!docs/AI_Assistant_How_It_Works.pdf
 *.pptx
 *.docx
 *.xlsx
