@@ -42,6 +42,20 @@ import json
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 
+# Console output is UTF-8 regardless of the terminal's own encoding.
+# Windows consoles default to cp1252, which cannot encode the box-drawing and
+# check characters used in this project's banners. An unguarded print then
+# raises UnicodeEncodeError from inside module import or setup, and the caller
+# sees an unrelated failure -- in one case retrieval silently returned zero
+# sources and every answer became a refusal.
+import sys as _sys
+for _stream in (_sys.stdout, _sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+
 try:
     from dotenv import load_dotenv
     load_dotenv()

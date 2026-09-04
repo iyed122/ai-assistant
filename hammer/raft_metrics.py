@@ -43,6 +43,20 @@ import re
 import statistics
 from pathlib import Path
 
+# Console output is UTF-8 regardless of the terminal's own encoding.
+# Windows consoles default to cp1252, which cannot encode the box-drawing and
+# check characters used in this project's banners. An unguarded print then
+# raises UnicodeEncodeError from inside module import or setup, and the caller
+# sees an unrelated failure -- in one case retrieval silently returned zero
+# sources and every answer became a refusal.
+import sys as _sys
+for _stream in (_sys.stdout, _sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+
 # ── identifier shapes used for both fabrication and fact recall ──────────────
 TICKET_RE = re.compile(r"\b[A-Z][A-Z0-9]{1,9}-\d{1,6}\b")
 VERSION_RE = re.compile(r"\b\d+\.\d+(?:\.\d+){0,3}\b")

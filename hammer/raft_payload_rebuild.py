@@ -50,6 +50,20 @@ import re
 from pathlib import Path
 from typing import Optional
 
+# Console output is UTF-8 regardless of the terminal's own encoding.
+# Windows consoles default to cp1252, which cannot encode the box-drawing and
+# check characters used in this project's banners. An unguarded print then
+# raises UnicodeEncodeError from inside module import or setup, and the caller
+# sees an unrelated failure -- in one case retrieval silently returned zero
+# sources and every answer became a refusal.
+import sys as _sys
+for _stream in (_sys.stdout, _sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+
 # A context block starts at a line like "[confluence] Release 4.1.20.8" and runs
 # until the "---" separator that the renderer writes between blocks.
 BLOCK_RE = re.compile(r"^\[([a-z_]+)\]\s+(.+?)\s*$", re.MULTILINE)
