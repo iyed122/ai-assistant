@@ -64,9 +64,9 @@ Built and tested against a real enterprise corpus, not a toy dataset:
 
 ## Screenshots
 
-| Grounded answer with sources | Hammer / RAGAS evaluation |
+| Answering from retrieved context | Hammer / RAGAS evaluation |
 |---|---|
-| ![Inference](docs/images/home.png) | ![Hammer](docs/images/hammer_eval.png) |
+| ![Answer](docs/images/answer_grounded.png) | ![Hammer](docs/images/hammer_eval.png) |
 
 | RAFT training configuration | MLflow run history |
 |---|---|
