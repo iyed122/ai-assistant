@@ -4,8 +4,9 @@ import { useState, useEffect, useRef, useCallback } from 'react'
  * TrainingPanel — Pipeline Control + Run History + Live Loss Curve
  *
  * Sub-tabs:
- *   Pipeline  — Config form → Prepare → Train (SSE live logs + loss curve)
- *   Runs      — MLflow run history, promote button, current production model
+ *   Pipeline   — Config form → Prepare → Train (SSE live logs + loss curve)
+ *   Evaluation — Both arms over the held-out set, scored, then the gate
+ *   Runs       — MLflow run history, promote button, current production model
  *
  * Endpoints:
  *   POST /training/prepare           → dataset stats
@@ -15,6 +16,7 @@ import { useState, useEffect, useRef, useCallback } from 'react'
  *   POST /training/promote/:run_id   → promote to production
  *   GET  /training/model/current     → current production model
  *   GET  /training/config            → default config
+ *   POST /raft/evaluate/run          → SSE stream (both arms, scoring, gate)
  */
 
 const API = ''
@@ -710,6 +712,200 @@ function RunsTab({ view = 'runs' }) {
 // Main TrainingPanel export
 // ═════════════════════════════════════════════════════════════════════════════
 
+// ── Evaluation tab ─────────────────────────────────────────────────────────
+//
+// The two arms. Both are generated through the same served model at the same
+// quantisation, so the only difference between them is the adapter -- that is
+// what makes the comparison mean anything, and it is why this runs the base and
+// the candidate back to back rather than reusing an older baseline.
+//
+// The gate reads the two metric files this produces. It is the same gate the
+// Promote control runs; nothing here is a second decision rule.
+//
+// Runs write to their own directory under the scratch root. The root itself
+// holds the measured evidence for the delivered experiment and is never
+// overwritten from here.
+
+const EVAL_STEPS = [
+  ['generate:before', 'Generate baseline arm', 'base model, no adapter'],
+  ['generate:after',  'Generate adapter arm',  'same server, same quantisation'],
+  ['metrics:before',  'Score baseline',        'deterministic, no LLM judge'],
+  ['metrics:after',   'Score adapter',         'identical scorer'],
+  ['gate',            'Promotion gate',        'thresholds fixed before training'],
+]
+
+function EvaluationTab() {
+  const [beforeModel, setBeforeModel] = useState('qwen3:8b')
+  const [afterModel,  setAfterModel]  = useState('weaver-raft-full')
+  const [limit,       setLimit]       = useState(6)
+  const [running,     setRunning]     = useState(false)
+  const [stepState,   setStepState]   = useState({})   // name -> 'running'|'done'|'error'
+  const [logs,        setLogs]        = useState([])
+  const [verdict,     setVerdict]     = useState(null)
+  const [runDir,      setRunDir]      = useState(null)
+  const logEndRef = useRef(null)
+
+  useEffect(() => { logEndRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [logs])
+
+  const handleRun = async () => {
+    setRunning(true); setLogs([]); setVerdict(null); setStepState({}); setRunDir(null)
+    try {
+      const res = await fetch(`${API}/raft/evaluate/run`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          before_model: beforeModel,
+          after_model: afterModel,
+          limit: Number(limit) || 0,
+        }),
+      })
+      if (!res.ok) throw new Error((await res.text()).slice(0, 300))
+
+      const reader = res.body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buffer += decoder.decode(value, { stream: true })
+        const lines = buffer.split('\n')
+        buffer = lines.pop()
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue
+          let evt
+          try { evt = JSON.parse(line.slice(6)) } catch { continue }
+          if (evt.event === 'run_dir')    setRunDir(evt.path)
+          if (evt.event === 'step_start') setStepState(s => ({ ...s, [evt.step]: 'running' }))
+          if (evt.event === 'step_done')  setStepState(s => ({ ...s, [evt.step]: 'done' }))
+          if (evt.event === 'error')      setStepState(s => ({ ...s, [evt.step]: 'error' }))
+          if (evt.event === 'log')        setLogs(p => [...p, `${evt.step}  ${evt.line}`])
+          if (evt.event === 'done')       setVerdict(evt.verdict)
+        }
+      }
+    } catch (e) {
+      setLogs(p => [...p, `error: ${e.message}`])
+    } finally {
+      setRunning(false)
+    }
+  }
+
+  const dot = (st) => st === 'done' ? '#10b981'
+    : st === 'running' ? '#f59e0b'
+    : st === 'error' ? '#ef4444' : 'var(--border)'
+
+  return (
+    <div style={{ padding: 16, overflowY: 'auto', height: '100%' }}>
+      <SectionTitle>Held-out evaluation — both arms</SectionTitle>
+      <div style={{ fontSize: '0.72rem', opacity: 0.7, marginBottom: 12, maxWidth: 720 }}>
+        Runs the base model and the adapter over the same held-out questions, scores
+        each with the same deterministic scorer, then applies the promotion gate to
+        the two results. No LLM judge takes part in the scoring.
+      </div>
+
+      <div style={{ display: 'flex', gap: 10, alignItems: 'flex-end', flexWrap: 'wrap', marginBottom: 14 }}>
+        <label style={{ display: 'flex', flexDirection: 'column', gap: 2, fontSize: '0.72rem' }}>
+          <span style={{ opacity: 0.7, fontWeight: 500 }}>Baseline model</span>
+          <input value={beforeModel} onChange={e => setBeforeModel(e.target.value)}
+            style={{ padding: '5px 8px', borderRadius: 6, border: '1px solid var(--border)',
+              background: 'var(--bg-primary)', color: 'var(--text-primary)',
+              fontSize: '0.72rem', fontFamily: 'var(--font-mono)', width: 170 }} />
+        </label>
+        <label style={{ display: 'flex', flexDirection: 'column', gap: 2, fontSize: '0.72rem' }}>
+          <span style={{ opacity: 0.7, fontWeight: 500 }}>Candidate model</span>
+          <input value={afterModel} onChange={e => setAfterModel(e.target.value)}
+            style={{ padding: '5px 8px', borderRadius: 6, border: '1px solid var(--border)',
+              background: 'var(--bg-primary)', color: 'var(--text-primary)',
+              fontSize: '0.72rem', fontFamily: 'var(--font-mono)', width: 190 }} />
+        </label>
+        <label style={{ display: 'flex', flexDirection: 'column', gap: 2, fontSize: '0.72rem' }}>
+          <span style={{ opacity: 0.7, fontWeight: 500 }}>Questions (0 = all 79)</span>
+          <input type="number" min="0" value={limit} onChange={e => setLimit(e.target.value)}
+            style={{ padding: '5px 8px', borderRadius: 6, border: '1px solid var(--border)',
+              background: 'var(--bg-primary)', color: 'var(--text-primary)',
+              fontSize: '0.72rem', fontFamily: 'var(--font-mono)', width: 90 }} />
+        </label>
+        <button onClick={handleRun} disabled={running} className="tp-btn tp-btn-primary">
+          {running ? 'Evaluating…' : 'Run evaluation'}
+        </button>
+      </div>
+
+      {/* Step progress */}
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginBottom: 14 }}>
+        {EVAL_STEPS.map(([key, label, note]) => (
+          <div key={key} style={{ display: 'flex', alignItems: 'center', gap: 10, fontSize: '0.72rem' }}>
+            <span style={{ width: 9, height: 9, borderRadius: '50%', background: dot(stepState[key]),
+              flexShrink: 0, transition: 'background 200ms' }} />
+            <span style={{ fontWeight: 600, minWidth: 190 }}>{label}</span>
+            <span style={{ opacity: 0.55 }}>{note}</span>
+          </div>
+        ))}
+      </div>
+
+      {runDir && (
+        <div style={{ fontSize: '0.66rem', opacity: 0.5, fontFamily: 'var(--font-mono)', marginBottom: 8 }}>
+          writing to {runDir}
+        </div>
+      )}
+
+      {/* Live log */}
+      {logs.length > 0 && (
+        <div style={{
+          background: 'var(--bg-primary)', border: '1px solid var(--border)', borderRadius: 8,
+          padding: 10, maxHeight: 210, overflowY: 'auto', marginBottom: 14,
+          fontFamily: 'var(--font-mono)', fontSize: '0.66rem', lineHeight: 1.55,
+        }}>
+          {logs.map((l, i) => <div key={i} style={{ opacity: 0.8 }}>{l}</div>)}
+          <div ref={logEndRef} />
+        </div>
+      )}
+
+      {/* Verdict — the same gate the Promote control runs */}
+      {verdict && (
+        <div style={{
+          borderRadius: 8, padding: 14,
+          background: verdict.verdict === 'PROMOTE' ? 'rgba(16,185,129,0.08)' : 'rgba(239,68,68,0.08)',
+          border: `1px solid ${verdict.verdict === 'PROMOTE' ? 'rgba(16,185,129,0.4)' : 'rgba(239,68,68,0.4)'}`,
+        }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 8 }}>
+            <span style={{ fontWeight: 700, fontSize: '0.8rem',
+              color: verdict.verdict === 'PROMOTE' ? '#10b981' : '#ef4444' }}>
+              GATE: {verdict.verdict}
+            </span>
+            <span style={{ fontSize: '0.68rem', opacity: 0.6 }}>n = {verdict.n_measurable}</span>
+          </div>
+          <div style={{ fontSize: '0.72rem', opacity: 0.85, marginBottom: 10 }}>{verdict.reason}</div>
+          {[
+            ['PRIMARY',   'golden-passage recall', verdict.golden_fact_recall],
+            ['SECONDARY', 'fabrication rate',      verdict.fabrication_rate],
+            ['GUARD',     'refusal rate',          verdict.refusal_rate],
+            ['MECHANISM', 'quote grounding',       verdict.quote_grounding],
+          ].filter(([, , m]) => m).map(([role, name, m]) => (
+            <div key={role} style={{ display: 'flex', gap: 10, alignItems: 'baseline',
+              fontSize: '0.7rem', fontFamily: 'var(--font-mono)', padding: '3px 0' }}>
+              <span style={{ opacity: 0.5, minWidth: 82 }}>{role}</span>
+              <span style={{ minWidth: 168, opacity: 0.8 }}>{name}</span>
+              <span>{Number(m.before).toFixed(1)}% → {Number(m.after).toFixed(1)}%</span>
+              <span style={{ opacity: 0.65 }}>
+                {m.delta_pts > 0 ? '+' : ''}{Number(m.delta_pts).toFixed(1)} pts
+              </span>
+              {m.sigma !== undefined && (
+                <span style={{ color: m.sigma >= (verdict.thresholds?.min_sigma ?? 2) ? '#10b981' : '#ef4444' }}>
+                  {Number(m.sigma).toFixed(1)} SE
+                </span>
+              )}
+            </div>
+          ))}
+          <div style={{ fontSize: '0.64rem', opacity: 0.5, marginTop: 10 }}>
+            thresholds fixed before training · min {verdict.thresholds?.min_sigma} SE ·
+            refusal ≤ +{verdict.thresholds?.refusal_degenerate_pts} pts ·
+            fabrication ≤ +{verdict.thresholds?.fabrication_tolerance_pts} pts
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
 export default function TrainingPanel() {
   const [tab, setTab] = useState('pipeline')
 
@@ -721,9 +917,10 @@ export default function TrainingPanel() {
         padding: '0 16px', background: 'var(--bg-secondary)',
       }}>
         {[
-          { key: 'pipeline', label: 'Pipeline' },
-          { key: 'runs',     label: 'MLflow Runs' },
-          { key: 'serving',  label: 'Serving' },
+          { key: 'pipeline',   label: 'Pipeline' },
+          { key: 'evaluation', label: 'Evaluation' },
+          { key: 'runs',       label: 'MLflow Runs' },
+          { key: 'serving',    label: 'Serving' },
         ].map(t => (
           <button
             key={t.key}
@@ -743,9 +940,10 @@ export default function TrainingPanel() {
 
       {/* Tab content */}
       <div style={{ flex: 1, overflow: 'hidden' }}>
-        {tab === 'pipeline' && <PipelineTab />}
-        {tab === 'runs'     && <RunsTab view="runs" />}
-        {tab === 'serving'  && <RunsTab view="serving" />}
+        {tab === 'pipeline'   && <PipelineTab />}
+        {tab === 'evaluation' && <EvaluationTab />}
+        {tab === 'runs'       && <RunsTab view="runs" />}
+        {tab === 'serving'    && <RunsTab view="serving" />}
       </div>
     </div>
   )

@@ -33,6 +33,7 @@ import logging
 import os
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -62,7 +63,16 @@ class EvaluateRequest(BaseModel):
     after_model: str = "weaver-raft"
     before_model: str = "qwen3:8b"
     payload: str = "measurable_payload.jsonl"
+    # 0 = the whole holdout (79 questions per arm, ~45 min). A small limit is
+    # what makes this demonstrable in a UI: the pipeline is identical, only
+    # shorter.
     limit: int = 0
+    # Where the run writes. NEVER the scratch root: that directory holds the
+    # measured evidence for the delivered experiment (metrics_before.json,
+    # metrics_after.json, both answer files, the verdict), and a UI-triggered
+    # run that overwrote them would destroy the result it is demonstrating.
+    # Each run gets its own subdirectory instead.
+    out_dir: str = ""
 
 
 def _sse(event: str, **data) -> str:
@@ -124,29 +134,61 @@ async def run_evaluation(req: EvaluateRequest):
 
     SCRATCH.mkdir(parents=True, exist_ok=True)
 
+    # The payload is named relative to the scratch root, where the rebuilt
+    # holdout lives; an absolute path is honoured as given.
+    payload = Path(req.payload)
+    if not payload.is_absolute():
+        payload = SCRATCH / payload
+    if not payload.exists():
+        raise HTTPException(400, f"payload not found: {payload}")
+
+    # Each run writes into its own directory. The scratch root itself is
+    # read-only from here -- see EvaluateRequest.out_dir.
+    run_dir = Path(req.out_dir) if req.out_dir else \
+        SCRATCH / "ui_runs" / datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    before_a = run_dir / "local_before.jsonl"
+    after_a = run_dir / "local_after.jsonl"
+    m_before = run_dir / "metrics_before.json"
+    m_after = run_dir / "metrics_after.json"
+    verdict_file = run_dir / "raft_gate_verdict.json"
+
+    lim = ["--limit", str(req.limit)] if req.limit else []
+
     async def stream():
+        # Modules, not bare filenames: these live in hammer/ and are run with
+        # the project root as cwd so their package imports resolve. Generation
+        # only needs an HTTP client, so it runs in the project venv; scoring and
+        # the gate run in venv_hammer.
         steps = [
-            ("generate:before", [str(VENV), "local_generate.py",
-                                 "--out", "local_before.jsonl",
+            ("generate:before", [str(VENV), "-m", "hammer.raft_generate",
                                  "--model", req.before_model,
-                                 "--payload", req.payload, "--pause-every", "0"]),
-            ("generate:after", [str(VENV), "local_generate.py",
-                                "--out", "local_after.jsonl",
+                                 "--payload", str(payload),
+                                 "--out", str(before_a)] + lim),
+            ("generate:after", [str(VENV), "-m", "hammer.raft_generate",
                                 "--model", req.after_model,
-                                "--payload", req.payload, "--pause-every", "0"]),
-            ("metrics:before", [str(VENV_HAMMER), "raft_metrics.py",
-                                "local_before.jsonl", req.payload, "before"]),
-            ("metrics:after", [str(VENV_HAMMER), "raft_metrics.py",
-                               "local_after.jsonl", req.payload, "after"]),
+                                "--payload", str(payload),
+                                "--out", str(after_a)] + lim),
+            ("metrics:before", [str(VENV_HAMMER), "-m", "hammer.raft_metrics",
+                                "--answers", str(before_a),
+                                "--payload", str(payload),
+                                "--tag", "before", "--out", str(m_before)]),
+            ("metrics:after", [str(VENV_HAMMER), "-m", "hammer.raft_metrics",
+                               "--answers", str(after_a),
+                               "--payload", str(payload),
+                               "--tag", "after", "--out", str(m_after)]),
             ("gate", [str(VENV_HAMMER), "-m", "hammer.raft_gate",
-                      "--before", "metrics_before.json",
-                      "--after", "metrics_after.json"]),
+                      "--before", str(m_before), "--after", str(m_after),
+                      "--out", str(verdict_file)]),
         ]
+
+        yield _sse("run_dir", path=str(run_dir))
 
         for name, cmd in steps:
             yield _sse("step_start", step=name)
             proc = await asyncio.create_subprocess_exec(
-                *cmd, cwd=str(SCRATCH),
+                *cmd, cwd=str(ROOT),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT)
             assert proc.stdout is not None
@@ -160,10 +202,9 @@ async def run_evaluation(req: EvaluateRequest):
                 return
             yield _sse("step_done", step=name)
 
-        verdict_file = SCRATCH / "raft_gate_verdict.json"
         verdict = json.loads(verdict_file.read_text(encoding="utf-8")) \
             if verdict_file.exists() else None
-        yield _sse("done", verdict=verdict)
+        yield _sse("done", verdict=verdict, run_dir=str(run_dir))
 
     return StreamingResponse(stream(), media_type="text/event-stream")
 
