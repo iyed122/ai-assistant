@@ -378,7 +378,9 @@ def main() -> None:
             shot("04_raft_config")
         except Exception as e:
             print("config scene:", e)
-        r.mark("raft_config", s)
+        # Compressed a little to make room for the evaluation scene below
+        # without pushing the cut past two and a half minutes.
+        r.mark("raft_config", s, target=20.0)
 
 
         # ── 5. Runs: the MLflow-backed history, in-app ─────────────────────
@@ -410,6 +412,67 @@ def main() -> None:
         except Exception as e:
             print("runs scene:", e)
         r.mark("mlflow_runs", s)
+
+        # ── 5b. The two arms, run from the application ─────────────────────
+        # This is what the gate reads. The base model and the candidate answer
+        # the same held-out questions through the same server at the same
+        # quantisation, so the only difference between the arms is the adapter;
+        # both are then scored by the same deterministic scorer, with no LLM
+        # judge involved.
+        #
+        # The run is real and it is short: two questions rather than the full
+        # 79, because a full pass is roughly forty-five minutes and the pipeline
+        # is identical either way. Only the start is filmed -- the same
+        # treatment the training scene gets -- and the verdict has its own scene
+        # two beats later, so nothing is shown twice.
+        #
+        # It writes to its own ui_runs/<timestamp> directory. The measured
+        # evidence for the delivered experiment lives one level up and is never
+        # touched by a run started here.
+        s = r.now()
+        try:
+            r.click(page.get_by_role("button", name="Evaluation", exact=True).first,
+                    settle=2.0)
+            r.read(4.0)
+
+            # The two arms, named side by side: base, then candidate.
+            for field in ("Baseline model", "Candidate model"):
+                try:
+                    r.hover(page.get_by_text(field, exact=False).first, hold=1.5)
+                except Exception:
+                    pass
+            r.read(2.0)
+            shot("09b_eval_form")
+
+            n = page.locator("input[type=number]").first
+            r.move(n); r.beat()
+            r.p.evaluate("() => window.__clickFx()")
+            n.fill("2")
+            time.sleep(0.7)
+
+            run_btn = page.get_by_role("button", name="Run evaluation", exact=True).first
+            r.click(run_btn, settle=1.2)
+
+            # Watch the steps light up and the log fill. Long enough to read the
+            # step names and see the first arm actually generating.
+            r.read(12.0)
+            shot("09c_eval_running")
+        except Exception as e:
+            print("evaluation scene:", e)
+        r.mark("ui_evaluation", s, target=10.0)
+
+        # Back to the run history. The scene above switches sub-tabs, and the
+        # Promote control lives on the run's card -- without this the gate
+        # scenes below search a DOM that no longer contains the runs list and
+        # silently record nothing.
+        try:
+            r.click(page.get_by_role("button", name="MLflow Runs", exact=True).first,
+                    settle=2.0)
+            page.get_by_text("raft_20260902_full", exact=False).first \
+                .scroll_into_view_if_needed(timeout=10000)
+            time.sleep(0.8)
+        except Exception as e:
+            print("return-to-runs:", e)
 
         # ── 6. Promote: the gate refuses ───────────────────────────────────
         # No navigation. The Promote control is already on screen; clicking it
