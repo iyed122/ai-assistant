@@ -657,7 +657,7 @@ def validate_sentry_answer(
 # A version-like token: 4.22.5, 2.13, 5.15.2.1
 _VERSION_RE = re.compile(r"\b\d+\.\d+(?:\.\d+){0,2}\b")
 
-# A hyphenated config key / component id: ingress-nginx, pilot-manager-foundations
+# A hyphenated config key / component id: ingress-nginx, service-manager-foundations
 _CONFIG_KEY_RE = re.compile(r"\b[a-z][a-z0-9]*(?:-[a-z0-9]+){2,}\b")
 
 # A filename with a technical extension
@@ -704,7 +704,7 @@ def _loose(text: str) -> str:
 
     Exact containment produced false fabrications: `release-notes-1` appears in
     the context as part of a URL slug, and titles are re-punctuated when quoted
-    ("Release note - NEA Composer 2.8.0," with a trailing comma). Matching on a
+    ("Release note - Product-A Composer 2.8.0," with a trailing comma). Matching on a
     punctuation-free form keeps the check about whether the FACT is supported
     rather than whether the formatting matches.
     """
@@ -810,6 +810,29 @@ def _check_doc_jira_fabrication(answer: str, ctx: str, sources: List[Dict],
     return 0.25, f"fabricated_jira_keys: {bad[:3]}"
 
 
+# Document-title detection needs to know what a product name looks like in
+# the corpus being validated, and those names are deployment-specific.
+# Hard-coding one customer's vocabulary made the check silently weaker for
+# anyone else's documents, and placed that customer's product names in the
+# source of a public repository. Generic document-type phrases stay built in;
+# product names come from the environment:
+#
+#   VALIDATOR_PRODUCT_TERMS="Product-A|Platform[- ]?(?:One|Two)"
+#
+# Each term is a regex alternative, so prefixes and optional separators behave
+# as before. Unset, only the generic phrases apply.
+_DOC_TYPE_TERMS = (r"release note|upgrade procedure|installation procedure"
+                   r"|user guide|test report")
+
+
+def _title_hint_pattern():
+    """Build the document-title hint pattern for this deployment."""
+    import os
+    extra = (os.getenv("VALIDATOR_PRODUCT_TERMS") or "").strip().strip("|")
+    body = _DOC_TYPE_TERMS + ("|" + extra if extra else "")
+    return re.compile(r"\b(" + body + r")\b", re.I)
+
+
 def _check_confluence_title_fabrication(answer: str, ctx: str, sources: List[Dict],
                                         query: str) -> Tuple[float, str]:
     """
@@ -828,9 +851,7 @@ def _check_confluence_title_fabrication(answer: str, ctx: str, sources: List[Dic
     # as a citation. A title carries a product name or a document-type phrase,
     # and does not read as a clause — so spans containing a finite verb are
     # excluded.
-    _TITLE_HINT = re.compile(
-        r"\b(release note|upgrade procedure|installation procedure|user guide"
-        r"|test report|NEA[- ]?(?:DVR|CDN|Live|Composer)|TITAN|PILOT)\b", re.I)
+    _TITLE_HINT = _title_hint_pattern()
     _CLAUSE = re.compile(r"\b(is|are|was|were|must|should|can|will|has|have|does)\b", re.I)
     titleish = [s for s in spans
                 if (_VERSION_RE.search(s) or _TITLE_HINT.search(s)) and not _CLAUSE.search(s)]
