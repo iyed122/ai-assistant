@@ -8,7 +8,7 @@ production — never touches the LangGraph inference graph.
 Commands:
   score        — Run the evaluator on all unscored chat_history docs
   check        — Rolling quality check (alerts if score regresses)
-  dataset      — Export training datasets (qlora / dpo / grpo / seed / all)
+  dataset      — Export training datasets (raft / qlora / dpo / grpo / seed / all)
   benchmark    — Run the adapter gate benchmark before deployment
   deploy       — Mark a version as deployed in model_versions
   status       — Print full system status (scores, dataset readiness, versions)
@@ -18,6 +18,7 @@ Usage:
   python hammer/run_hammer.py score
   python hammer/run_hammer.py score --limit 50 --force
   python hammer/run_hammer.py check
+  python hammer/run_hammer.py dataset raft
   python hammer/run_hammer.py dataset all
   python hammer/run_hammer.py dataset qlora --out my_train.jsonl
   python hammer/run_hammer.py benchmark datasets/eval_set.jsonl --version qwen3-lora-v1
@@ -27,6 +28,18 @@ Usage:
 """
 
 from __future__ import annotations
+
+# Windows consoles default to cp1252, which has no glyph for the box-drawing
+# characters this CLI prints in its banners. An unguarded print therefore kills
+# `status` outright with UnicodeEncodeError -- the same failure that silently
+# disabled retrieval in rag/*.py. Force UTF-8 and degrade unmappable characters
+# rather than aborting the command.
+import sys as _sys
+for _stream in (_sys.stdout, _sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 import argparse
 import json
@@ -92,12 +105,16 @@ def cmd_check(args) -> None:
 def cmd_dataset(args) -> None:
     """Export training datasets."""
     from hammer.dataset_builder import (
-        export_qlora, export_dpo, export_grpo,
+        export_raft, export_qlora, export_dpo, export_grpo,
         export_seed_dataset, dataset_stats,
     )
 
     which = args.which.lower()
     out   = Path(args.out) if args.out else None
+
+    if which in ("raft", "all"):
+        n = export_raft(out, limit=args.limit)
+        logger.info("RAFT:  %d records", n)
 
     if which in ("qlora", "all"):
         n = export_qlora(out, limit=args.limit)
@@ -119,8 +136,8 @@ def cmd_dataset(args) -> None:
         import pprint
         pprint.pprint(dataset_stats())
 
-    if which not in ("qlora", "dpo", "grpo", "seed", "all", "stats"):
-        logger.error("Unknown dataset type: %s. Use: qlora / dpo / grpo / seed / all / stats", which)
+    if which not in ("raft", "qlora", "dpo", "grpo", "seed", "all", "stats"):
+        logger.error("Unknown dataset type: %s. Use: raft / qlora / dpo / grpo / seed / all / stats", which)
         sys.exit(1)
 
 

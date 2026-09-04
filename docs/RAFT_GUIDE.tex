@@ -1,0 +1,607 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[margin=2.2cm]{geometry}
+\usepackage{tabularx}
+\usepackage{booktabs}
+\usepackage{xcolor}
+\usepackage{colortbl}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{tcolorbox}
+\usepackage{fancyhdr}
+\hypersetup{colorlinks=true,linkcolor=black,urlcolor=blue!60!black}
+
+\definecolor{rowgray}{RGB}{243,245,248}
+\definecolor{good}{RGB}{18,105,58}
+\definecolor{bad}{RGB}{158,32,32}
+\definecolor{warn}{RGB}{176,110,10}
+\definecolor{navy}{RGB}{28,42,64}
+
+\newcolumntype{Y}{>{\raggedright\arraybackslash}X}
+\newcommand{\SHOW}{\textcolor{good}{\textbf{SHOW}}}
+\newcommand{\HIDE}{\textcolor{bad}{\textbf{DO NOT SHOW}}}
+\newcommand{\CARE}{\textcolor{warn}{\textbf{SHOW WITH CARE}}}
+
+\newtcolorbox{keybox}[1]{colback=blue!3,colframe=navy,fonttitle=\bfseries,title={#1}}
+\newtcolorbox{warnbox}[1]{colback=orange!4,colframe=warn,fonttitle=\bfseries,title={#1}}
+
+\pagestyle{fancy}\fancyhf{}
+\fancyhead[L]{\small RAFT --- what it is, why we chose it, what we measured}
+\fancyfoot[C]{\thepage}
+
+\title{\vspace{-1.6cm}\textbf{RAFT for a Graph-RAG Assistant}\\[0.25cm]
+\large Everything behind the fine-tuning decision:\\the method, the steps, the metrics, and what is safe to present}
+\author{Prepared for Iyed Mediouni --- PFE, TEK-UP $\times$ TELNET Holding}
+\date{17 August 2026}
+
+\begin{document}
+\maketitle
+\thispagestyle{fancy}
+
+\begin{keybox}{How to read this document}
+Every number in here was measured on your system. Each result carries a flag:
+\SHOW{} means it is solid and defensible under questioning; \CARE{} means it is real
+but needs a stated caveat; \HIDE{} means it would not survive a sharp question and
+should stay out of the report and the defence.
+
+Sections 2--4 teach the method. Sections 5--7 are what we did and what came out.
+Section 8 is the honest limitations list. Section 9 is defence preparation.
+\end{keybox}
+
+\tableofcontents
+\newpage
+
+\section{The problem in one page}
+
+Your assistant answers questions about internal documentation. Retrieval finds
+passages; the language model writes an answer from them. Two things can go wrong,
+and they are completely different failures:
+
+\begin{enumerate}[leftmargin=1.4em]
+  \item \textbf{Retrieval does not find the answer.} No amount of model training
+        fixes this --- the model never sees the text.
+  \item \textbf{Retrieval finds it and the model does not use it.} No amount of
+        code fixes this --- reading is what the model does.
+\end{enumerate}
+
+The whole fine-tuning argument rests on separating those two. If you cannot
+separate them, any claim about fine-tuning is contestable, because a reviewer can
+always answer ``you should have fixed retrieval instead.''
+
+We measured both.
+
+\begin{table}[h]\centering\small
+\begin{tabularx}{\textwidth}{Y r l}
+\toprule
+\textbf{Measurement (500-question held-out set)} & \textbf{Value} & \textbf{Whose fault} \\
+\midrule
+Retrieval returned the answering passage & 16\,\% & retrieval \\
+\rowcolor{rowgray} Model used it when it was ranked 1st--2nd & 71.6\,\% & --- \\
+Model ignored it entirely when ranked 1st--2nd & \textbf{28.4\,\%} & \textbf{the model} \\
+\rowcolor{rowgray} Answer contained a fabricated identifier & 2.6\,\% & the model (rare) \\
+Answer quoted its source verbatim & 2.19\,\% & the model \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+The third row is the one that justifies fine-tuning. A passage ranked \emph{first}
+cannot be blamed on ordering, cannot be recovered by raising \texttt{top\_k}, and
+cannot be repaired by a post-processing filter. The model was shown the answer and
+wrote something that contained none of it, more than a quarter of the time.
+
+\section{What RAFT actually is}
+
+\subsection{The exam analogy}
+
+The RAFT authors frame it as exam preparation, and the analogy is worth keeping
+because it makes the design obvious.
+
+\begin{itemize}[leftmargin=1.4em]
+  \item \textbf{Closed-book exam.} The model answers from memory alone. This is a
+        plain language model with no retrieval.
+  \item \textbf{Open-book exam.} The model is handed reference pages and answers
+        from them. This is RAG --- your system.
+  \item \textbf{Studying for an open-book exam.} Practising with the book open,
+        including pages that look relevant but are not, until you get good at
+        finding the right passage quickly. \textbf{This is RAFT.}
+\end{itemize}
+
+The key insight: standard RAG never practises. The model was trained to write
+fluent text, then at inference time is suddenly handed six documents and expected
+to pick correctly among them. RAFT trains that specific skill.
+
+\subsection{The training recipe}
+
+Each training example is a question, a set of documents, and an answer. Two kinds
+of example, mixed in a fixed proportion $P$:
+
+\begin{table}[h]\centering\small
+\begin{tabularx}{\textwidth}{l Y}
+\toprule
+\textbf{$P$\,\% of examples} & question + \textbf{golden} passage + several \textbf{distractor} passages
+$\rightarrow$ answer that reasons and quotes the golden passage \\
+\rowcolor{rowgray} \textbf{$(1-P)$\,\% of examples} & question + \textbf{distractors only}, no golden passage
+$\rightarrow$ (in our version) an explicit abstention \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\textbf{Golden document:} the passage that actually answers the question.\\
+\textbf{Distractor document:} a passage that is topically related but does not
+contain the answer. In your corpus these are brutal --- ask about release 4.16.0
+and retrieval returns 4.16.1, 4.20.3 and 4.28.0. They look almost identical.
+
+We used $P = 0.80$: 794 examples with the golden passage present, 199 without.
+
+\subsection{The chain-of-thought format}
+
+RAFT does not train the model to emit a bare answer. It trains a reasoning chain
+that quotes its evidence:
+
+\begin{quote}\ttfamily\small
+\#\#Reason: The documentation states that the 2.5.0 micro-service uses an ingress
+controller. \#\#begin\_quote\#\# File Micro Service version 2.5.0 integrates a
+HTTP reverse proxy and uses an ingress controller to expose only one entry point
+\#\#end\_quote\#\# Therefore the ingress controller must be installed first.\\
+\#\#Answer: Install the ingress controller before deploying, and keep previously
+exposed services as ClusterIP rather than LoadBalancer.
+\end{quote}
+
+Two things happen when a model is trained on thousands of these:
+
+\begin{enumerate}[leftmargin=1.4em]
+  \item \textbf{It learns to locate before it writes.} The quote must come from
+        somewhere, so the model develops the habit of finding the supporting span
+        first.
+  \item \textbf{The answer becomes checkable.} A reader can verify the quote
+        against the page. An unquoted answer has to be trusted.
+\end{enumerate}
+
+The RAFT paper shows this matters: training on answers alone (no reasoning chain)
+causes loss to fall quickly and the model to overfit to short answers. The
+reasoning chain prevents that.
+
+\subsection{Why the distractor-only examples exist}
+
+This is the subtle part, and it is where we deliberately diverged from the paper.
+
+In the original RAFT, the $(1-P)$ examples \emph{keep the same answer} even though
+the golden document was removed. The paper's words: it ``compel[s] the model to
+memorize answers instead of deriving them from the context.'' For their benchmarks
+that is a feature --- it builds robustness.
+
+For a documentation assistant it is a bug. A model taught to answer when the
+evidence is absent is a model taught to fabricate. This weakness is documented:
+\emph{Divide-Then-Align} (ACL 2025) shows RAFT ``conditions models to generate
+answers even in the absence of reliable knowledge.''
+
+\begin{keybox}{{Our deviation, and why it is defensible}}
+In our training set the distractor-only examples target an \textbf{abstention} ---
+``the provided context does not contain this information'' --- rather than the
+memorised answer. The model is taught: \emph{quote the passage when it is there,
+decline when it is not.}
+
+This aligns with Google Research's ``sufficient context'' work, which recommends
+treating abstention as a first-class response rather than a failure to minimise.
+State this deviation explicitly in the report; it shows you read the method
+critically rather than copying it.
+\end{keybox}
+
+\subsection{What the published results show}
+
+\begin{table}[h]\centering\small
+\begin{tabular}{l ccccc}
+\toprule
+ & \textbf{PubMed} & \textbf{HotpotQA} & \textbf{HuggingFace} & \textbf{Torch Hub} & \textbf{TensorFlow} \\
+\midrule
+LLaMA2-7B + RAG & 58.8 & 0.03 & 26.43 & 8.60 & 43.06 \\
+\rowcolor{rowgray} Domain fine-tune (DSF) & 59.7 & 6.38 & 61.06 & 84.94 & 86.56 \\
+DSF + RAG & 71.6 & 4.41 & 42.59 & 82.80 & 60.29 \\
+\rowcolor{rowgray} \textbf{RAFT} & \textbf{73.30} & 35.28 & \textbf{74.00} & \textbf{84.95} & \textbf{86.86} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Look at the third row. \textbf{Domain fine-tuning plus RAG is often worse than
+domain fine-tuning alone} --- HuggingFace drops 61 to 43, TensorFlow 87 to 60.
+Naively fine-tuning a model and then bolting retrieval onto it actively hurts.
+
+That single row is your strongest published answer to ``why not just fix the
+code'': the interaction between fine-tuning and retrieval is a real research
+problem with a published remedy, not a plumbing detail.
+
+\section{Why RAFT and not the alternatives}
+
+\begin{table}[h]\centering\small
+\begin{tabularx}{\textwidth}{l l Y}
+\toprule
+\textbf{Method} & \textbf{Year} & \textbf{Why it was not chosen} \\
+\midrule
+Vanilla QLoRA SFT & 2023 & Teaches answering style, not document selection. Does not
+address the measured defect. \\
+\rowcolor{rowgray} DPO on corrupted pairs & 2023 & We built this and the gate rejected the adapter.
+The pairs were 93\,\% synthetic corruptions; the model learned to decline. \\
+GRPO & 2024--25 & Needs a learned or online reward. Ours is already exact,
+deterministic and free --- adding a reward model adds approximation error where an
+exact reward exists. \\
+\rowcolor{rowgray} RLHF / PPO & 2022 & Requires human preference labels nobody at TELNET produced. \\
+ORPO / SimPO / KTO & 2024 & Preference variants; same data problem as DPO, and each
+needs a new trainer wired into the pipeline. \\
+\textbf{RAFT} & \textbf{2024} & \textbf{Targets document selection --- the measured
+defect --- and runs on the existing QLoRA trainer with only the dataset changed.} \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\begin{keybox}{The distinction to get right in the defence}
+RAFT is \textbf{not} an alternative to QLoRA. QLoRA is \emph{how} the weights are
+updated efficiently; RAFT is \emph{what} the model is shown. You ran RAFT
+\emph{with} QLoRA. Anyone who knows the field will notice if you present them as
+competing options.
+\end{keybox}
+
+\section{RAFT or GraphRAFT? --- and why traversal scored zero here}
+
+This deserves its own section because the answer is counter-intuitive and a jury
+may well ask.
+
+\subsection{GraphRAFT does not apply to this architecture}
+
+GraphRAFT (2025) extends RAFT to knowledge graphs. Its contribution is training a
+model to \textbf{generate correct Cypher or SPARQL queries} for multi-hop graph
+questions --- the LLM writes the query, the graph executes it.
+
+\textbf{Your system does not work that way.} In this architecture,
+\texttt{rag/neo4j\_search.py} performs the traversal itself, in Python, with
+hand-written Cypher: vector search finds seed nodes, then the graph is expanded
+along typed relationships (\texttt{BLOCKS}, \texttt{RELATES\_TO},
+\texttt{CHILD\_OF}, \texttt{CAUSES}, \dots), then a cross-encoder reranks. The
+language model never sees a query language; it receives finished passages.
+
+Adopting GraphRAFT would therefore mean \emph{re-architecting retrieval} so that
+the LLM generates the queries --- replacing a deterministic component that works
+with a probabilistic one that can emit malformed Cypher. That is a different
+project, and a worse design for this use case.
+
+\begin{keybox}{{The one-sentence answer for the defence}}
+``GraphRAFT applies when the language model generates the graph queries. In this
+architecture traversal is deterministic and executed in code, so the trainable
+component is passage \emph{selection} --- which is precisely what RAFT addresses.''
+\end{keybox}
+
+\subsection{Why traversal contributed nothing in this benchmark}
+
+Of the 79 held-out questions where retrieval returned the answering passage,
+\textbf{all 79 came from vector search and none from graph traversal}. Read
+carelessly, that looks damning. It is not, and it must not be presented as a
+finding.
+
+\textbf{The benchmark cannot detect a traversal benefit, by construction.} Every
+question was generated from \emph{one sentence in one Confluence document} --- a
+single-hop lookup. Traversal exists to connect \emph{different} documents: which
+ticket blocks another, which page is a child of which, which release caused a
+regression. A single-hop question has nothing to traverse to, so the graph is
+being measured on the one task where it cannot help.
+
+\begin{warnbox}{{What is and is not safe to say about the graph}}
+\textbf{Safe:} ``On single-hop documentation lookups, graph expansion added no
+coverage while costing 2.4\,s per query. Its contribution to multi-hop questions
+was not evaluated in this study.''
+
+\textbf{Not safe:} ``The graph does not contribute.'' That claim requires a
+multi-hop benchmark this work did not build.
+
+\textbf{Worth noting:} traversal does \emph{not} depend on the Sentries API. The
+graph already contains 428k JiraTicket and 47k ConfluencePage nodes with typed
+relationships, so a multi-hop evaluation is possible today --- the API only
+supplies \emph{live} ticket state.
+\end{warnbox}
+
+\section{Every step we took, and why it mattered}
+
+\subsection{Step 1 --- Build questions with a known answer}
+
+1{,}568 questions, each generated \emph{from} a specific sentence in a specific
+document. This is the foundation of everything: because we know which sentence
+answers each question, we can check whether that sentence was retrieved and
+whether the answer used it. Without a known answer, none of the metrics are
+computable.
+
+Contexts came from your real retrieval path --- vector search, typed-relationship
+traversal, cross-encoder rerank --- so the benchmark reflects the deployed system.
+
+\subsection{Step 2 --- Split before building anything}
+
+500 questions held out, keyed on question id, written to disk \emph{before} a single
+training example was constructed.
+
+\textbf{Why it matters:} if the split happened afterwards, a question could land in
+both training and evaluation, and any improvement would be memorisation. Splitting
+on \emph{question} rather than on \emph{answer} also matters --- we had two answers
+per question from two engines, and splitting on answers would have put a question
+in training and a near-copy in the holdout.
+
+\subsection{Step 3 --- Recover the golden passage}
+
+Retrieval returned the source document only 88\,\% of the time in the training
+pool, so we fetched the golden passage back from Neo4j by title.
+
+\textbf{Why it matters:} RAFT \emph{composes} its training context deliberately.
+Relying on retrieval to supply the golden passage would have silently dropped the
+majority of training examples. Evaluation was left untouched --- the holdout is
+answered against whatever retrieval actually returns.
+
+\subsection{Step 4 --- Generate reasoning chains with a stronger model}
+
+993 chain-of-thought answers written by \texttt{gpt-oss:120b}, each validated:
+any answer quoting text absent from the context was discarded (75 were, 7\,\%).
+
+\textbf{Why it matters, and the trap avoided:} the teacher writes \emph{training
+data only}. Evaluation is entirely deterministic --- validator plus refusal
+classifier, no model judgement. If the same model both taught and graded, the
+result would be circular and a jury would say so.
+
+\subsection{Step 5 --- Compose the dataset}
+
+914 training / 79 evaluation examples at $P = 0.80$, with the golden passage
+inserted at a \textbf{random rank} among the distractors.
+
+\textbf{Why the random rank matters:} if the golden passage were always first, the
+model would learn ``the answer is at the top'' --- an artefact of our construction,
+not a reading skill. Randomising forces it to actually locate the passage.
+
+\subsection{Step 6 --- Measure the baseline before training}
+
+500 held-out questions answered by the untouched model, scored on nine metrics
+fixed in advance.
+
+\textbf{Why in advance:} metrics chosen after seeing results are worthless. Ours
+were written into the harness before the adapter existed, along with the numeric
+thresholds that would decide whether to train at all.
+
+\section{The metrics, explained}
+
+\begin{table}[h]\centering\small
+\begin{tabularx}{\textwidth}{l Y}
+\toprule
+\textbf{Metric} & \textbf{What it means and why it is there} \\
+\midrule
+\textbf{golden-fact recall} & Of the versions and quantities in the answering
+sentence, how many appear in the model's answer. Measured only where retrieval
+actually returned that sentence --- the model cannot use what it never saw.
+\emph{This is the primary metric.} \\
+\rowcolor{rowgray} \textbf{zero recall} & Share of answers containing \emph{none} of
+those facts. The blunt version of the above: the model had the passage and used
+nothing from it. \\
+\textbf{recall by rank} & Recall broken down by where the answering passage sat in
+the context. Separates what retrieval ordering causes (fixable in config) from what
+the model causes (not). \\
+\rowcolor{rowgray} \textbf{fabrication rate} & Validator v1.2: a version, config key,
+quantity, page title or URL asserted but absent from the context. Deterministic. \\
+\textbf{quote grounding} & Share of the answer's 8-word spans appearing verbatim in
+the context. This measures RAFT's \emph{mechanism} directly, not just its outcome. \\
+\rowcolor{rowgray} \textbf{refusal rate} & Guard metric. Must not rise. Adapter~1
+``improved'' by declining more (75.4\,\% $\rightarrow$ 93.4\,\%); a metric that can be
+gamed by silence is not a metric. \\
+\textbf{bare vs helpful refusal} & Whether a refusal offers anything usable. \\
+\rowcolor{rowgray} \textbf{evidence similarity} & Embedding similarity between answer
+and answering sentence. Catches answers that cite the right version but describe it
+wrongly. \\
+\textbf{answer length} & Regression guard --- RAFT answers are longer by design;
+tripling would be a problem, not a win. \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+Every one is deterministic and free. That is what makes a 500-question holdout
+affordable, and a 3.5-point improvement detectable where a judge-scored holdout of
+130 could only see 10 points.
+
+\section{Baseline results, with presentation flags}
+
+\begin{table}[h]\centering\small
+\begin{tabularx}{\textwidth}{Y r l}
+\toprule
+\textbf{Result (500-question holdout)} & \textbf{Value} & \textbf{Flag} \\
+\midrule
+Fabrication rate & 2.6\,\% & \SHOW \\
+\rowcolor{rowgray} Golden-fact recall when passage retrieved & 69.2\,\% & \SHOW \\
+Perfect recall & 64.6\,\% & \SHOW \\
+\rowcolor{rowgray} Declines when the passage is genuinely absent & 73.5\,\% & \SHOW \\
+Zero recall at rank 1--2 & 28.4\,\% $\pm$ 10.8 & \CARE \\
+\rowcolor{rowgray} Quote grounding & 2.19\,\% & \SHOW \\
+Refusal rate & 66.4\,\% & \CARE \\
+\rowcolor{rowgray} Bare refusals (of refusals) & 71.4\,\% & \CARE \\
+Retrieval coverage & 14--16\,\% & \CARE \\
+\rowcolor{rowgray} Primary metric sample size & $n=79$ of 500 & \HIDE{} \emph{as a headline} \\
+Graph traversal supplied the answering passage & 0 of 79 & \HIDE \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection*{Why each flag}
+
+\textbf{\SHOW{} --- Fabrication 2.6\,\%.} Low, deterministic, measured on 500
+answers. This is a genuinely good result: your assistant rarely invents things.
+
+\textbf{\SHOW{} --- Recall 69.2\,\%, perfect 64.6\,\%.} When the system works end to
+end, it works well. Solid sample reasoning, clearly defined metric.
+
+\textbf{\SHOW{} --- Declines 73.5\,\% when evidence is absent.} This is
+\emph{correct behaviour} and worth presenting as such. Safety-first failure mode.
+
+\textbf{\SHOW{} --- Quote grounding 2.19\,\%.} A clean baseline on the exact
+mechanism RAFT trains. Whatever the adapter does to this number is meaningful.
+
+\textbf{\CARE{} --- Zero recall 28.4\,\%.} The point estimate cleared the
+pre-registered threshold, but the confidence interval runs 17.6--39.2\,\%. Present
+it \emph{with} the interval. Never present it as ``28\,\%'' alone.
+
+\textbf{\CARE{} --- Refusal 66.4\,\%.} True but easy to misread as the model being
+unhelpful. It must be presented together with the coverage number, because most of
+those refusals are correct given that the evidence was absent.
+
+\textbf{\CARE{} --- Coverage 14--16\,\%.} Real and important, but measured on
+\emph{templated} questions (``What does the X documentation state about Y''). Real
+engineers do not phrase questions that way. Say ``on this benchmark'', never ``our
+RAG retrieves badly''.
+
+\textbf{\HIDE{} --- $n=79$ as a headline.} If you put the primary metric on a slide
+without the sample size, the first question will expose it. Either show $n$ and the
+interval, or lead with a different metric.
+
+\textbf{\HIDE{} --- ``graph traversal contributed nothing''.} In all 79 cases the
+answering passage came from vector search, none from traversal. \textbf{Do not
+present this as a finding.} Every question in this benchmark is single-hop by
+construction --- built from one sentence in one document --- which is exactly the
+question type where traversal cannot help. The benchmark cannot evaluate the graph,
+and the honest position is that its contribution here is untested, not zero.
+
+\begin{warnbox}{{The retrieval sweep: what it does and does not license}}
+We swept nine retrieval configurations. Coverage moved from 14.0\,\% to 14.8\,\% ---
+essentially nothing --- across wider windows, more hops, larger expansion and no
+reranker.
+
+\textbf{Safe to say:} on this benchmark, retrieval coverage is not recoverable by
+configuration; it points at chunking and embeddings, which is a re-index.
+
+\textbf{Not safe to say:} that graph expansion is useless. It cost 2.4\,s per query
+for no coverage gain \emph{on single-hop documentation questions}. Your Jira and
+GitLab traffic --- where relationships between tickets are the whole point --- was
+never tested, because the API was not available.
+\end{warnbox}
+
+\section{What happened, and what it taught}
+
+Two adapters were trained on the first version of the RAFT set. \textbf{The gate
+rejected both}, for opposite reasons, and the pair of failures is more instructive
+than a single promotion would have been.
+
+\begin{table}[h]\centering\small
+\begin{tabularx}{\textwidth}{l Y}
+\toprule
+\textbf{Candidate} & \textbf{Gate verdict} \\
+\midrule
+Higher lr, full data & \textbf{REJECT} --- degenerate abstention: refusals rose past
+the pre-registered limit \\
+\rowcolor{rowgray} Lower lr, 73\,\% of data & \textbf{REJECT} --- fabrication rose:
+refusals \emph{fell}, and the model answered where it should have declined \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\begin{warnbox}{{The defect, and why nothing else caught it}}
+Every golden-absent example shared \textbf{one hardcoded abstention string} --- 20\,\%
+of the training set as a single identical target, and by far its largest duplicate.
+The model did not learn to decline when evidence is missing; it learned the string,
+and recited it verbatim on held-out questions whose evidence was present.
+
+The loss curve looked healthy throughout. The training gates in place at the time
+all passed. What caught it was the promotion gate, on the same
+degenerate-abstention rule that had already rejected an earlier DPO adapter.
+
+The identical recitation appeared on two independent stacks --- a rented T4 running
+fp16, and the local server running 4-bit --- which is what establishes it as a
+property of the data rather than of any run.
+\end{warnbox}
+
+This is the documented failure mode of refusal-aware instruction tuning: supervised
+training on a fixed refusal pattern memorises the pattern rather than the decision
+boundary, and over-refuses on answerable questions. The corrective is that an
+abstention must be \emph{derived from its own context} --- naming the releases the
+retrieved passages actually cover, and the one they do not --- so that no fixed
+string exists to be memorised.
+
+\begin{table}[h]\centering\small
+\begin{tabularx}{\textwidth}{Y r r}
+\toprule
+\textbf{Training set} & \textbf{v1 (rejected)} & \textbf{v2 (current)} \\
+\midrule
+Examples & 914 & 912 \\
+\rowcolor{rowgray} Unique targets & 735 / 914 & \textbf{912 / 912} \\
+Most-repeated target & \textbf{180$\times$ (20\,\%)} & \textbf{1$\times$ (0.1\,\%)} \\
+\rowcolor{rowgray} Quote-marker coverage & 72\,\% & 78\,\% \\
+Spans marked verbatim that were not & 42 & \textbf{0} \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+Four pre-flight gates were added so the class of defect cannot recur silently: no
+target may exceed 5\,\% of the set; no example may lose its answer to truncation;
+training aborts when the loss stops being a finite number; and an adapter containing
+NaN values or dead low-rank factors cannot be saved. Each exists because something
+got past the checks that preceded it.
+
+\begin{keybox}{{The sentence to say about this}}
+The gate refused two adapters for measured reasons, and the second refusal is what
+exposed a data defect that would otherwise have shipped. The deliverable is not one
+adapter --- it is a loop that measures its own output, declines to deploy a
+regression, and says why.
+\end{keybox}
+
+\section{Limitations --- state these before anyone asks}
+
+\begin{enumerate}[leftmargin=1.4em,itemsep=3pt]
+  \item \textbf{The primary metric rests on 79 questions.} Retrieval supplied the
+        answering passage in only 16\,\% of cases, so the recall metric is only
+        computable there. Confidence interval $\pm$10 points.
+  \item \textbf{Questions are templated and machine-generated.} They are answerable
+        by construction and phrased uniformly. Real user questions differ, and the
+        coverage figure in particular may not transfer.
+  \item \textbf{Single-hop only.} The benchmark cannot evaluate graph traversal,
+        multi-document reasoning, or the live-API path.
+  \item \textbf{The Sentries API was unavailable.} Everything here is Confluence
+        documentation. Ticket-shaped questions were excluded because their
+        refusals reflect a missing API, not model behaviour.
+  \item \textbf{Training data is teacher-generated.} The reasoning chains were
+        written by \texttt{gpt-oss}, not by humans or by the model itself. Quotes
+        were validated against the context, but the reasoning was not human-checked.
+  \item \textbf{Train/serve quantisation differs.} Training used 4-bit NF4;
+        deployment through Ollama uses Q4\_K\_M. Measured earlier: fp16 fabricates
+        \textasciitilde3 points less than Q4, so quantisation is not free.
+  \item \textbf{One run, one seed.} No repeated runs, so run-to-run variance is
+        unmeasured.
+\end{enumerate}
+
+\section{Defence preparation}
+
+\begin{table}[h]\centering\small
+\begin{tabularx}{\textwidth}{Y Y}
+\toprule
+\textbf{Likely question} & \textbf{Answer} \\
+\midrule
+``Why not just fix the retrieval?'' & We tried. Nine configurations moved coverage
+by 0.8 points. And the defect we trained on occurs when the passage is already
+ranked first --- ordering cannot explain it. \\
+\rowcolor{rowgray} ``Why not a filter for fabricated URLs?'' & We should, and it is
+cheaper. It fixes fabricated citations. It cannot make a model read the paragraph
+it was given, which is what the 28\,\% is. \\
+``Isn't 79 questions too few?'' & For the primary metric, yes, and the interval is
+stated. The mechanism metric (quote grounding) is measured on all 500. \\
+\rowcolor{rowgray} ``Did the graph help?'' & Untested here. This benchmark is
+single-hop by construction; traversal is designed for multi-hop ticket
+relationships, which the missing API prevented us from evaluating. \\
+``Why RAFT rather than DPO?'' & DPO was run first and the gate rejected it. The
+pairs were 93\,\% synthetic corruptions, and the model learned to decline rather
+than to ground. RAFT targets document selection with real reasoning chains. \\
+\rowcolor{rowgray} ``What if the gate rejects this one too?'' & Then the loop worked.
+A gate that never rejects is decoration. The first rejection was diagnosed --- refusal
+contamination in the pairs --- and the pipeline corrected. \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\section*{References}
+\small
+\begin{itemize}[leftmargin=1.2em,itemsep=1pt]
+  \item Zhang, Patil et al. \textit{RAFT: Adapting Language Model to Domain Specific RAG}, 2024. \url{https://arxiv.org/abs/2403.10131}
+  \item \textit{Divide-Then-Align: Honest Alignment based on the Knowledge Boundary of RAG}, ACL 2025. \url{https://arxiv.org/pdf/2505.20871}
+  \item Joren et al. \textit{Sufficient Context: A New Lens on Retrieval Augmented Generation}, 2024. \url{https://arxiv.org/pdf/2411.06037}
+  \item Hu et al. \textit{LoRA: Low-Rank Adaptation of Large Language Models}, 2021.
+  \item Dettmers et al. \textit{QLoRA: Efficient Finetuning of Quantized LLMs}, 2023.
+  \item Rafailov et al. \textit{Direct Preference Optimization}, 2023.
+  \item Meta AI. \textit{RAFT: Sailing Llama towards better domain-specific RAG}, 2024.
+\end{itemize}
+
+\end{document}

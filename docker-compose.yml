@@ -11,8 +11,9 @@ services:
       # Password comes from .env — compose reads it automatically.
       NEO4J_AUTH: "neo4j/${NEO4J_PASSWORD:?set NEO4J_PASSWORD in .env}"
       NEO4J_PLUGINS: '["apoc"]'
-      NEO4J_server_memory_heap_initial__size: "512m"
-      NEO4J_server_memory_heap_max__size: "1g"
+      NEO4J_server_memory_heap_initial__size: "1g"
+      NEO4J_server_memory_heap_max__size: "4g"
+      NEO4J_server_memory_pagecache_size: "2g"
     volumes:
       # Fresh isolated named volume by default. Point NEO4J_DATA_PATH at an
       # existing Neo4j data dir in .env to reuse your own graph + embeddings.
@@ -38,6 +39,50 @@ services:
     restart: unless-stopped
     networks: [ai_net]
 
+  # ── Ollama (local LLM server: generation + the RAGAS judge) ──────────────────
+  # Containerised so that `docker compose up` really does bring up the whole
+  # stack. Set OLLAMA_HOST_DOCKER in .env to point the backend at a host install
+  # instead (e.g. http://host.docker.internal:11434) if you prefer to run the
+  # model server outside Docker.
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ai-ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_models:/root/.ollama
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list >/dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+    networks: [ai_net]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  # ── One-shot: pull the models the stack needs, then exit ─────────────────────
+  # Keeps the stack plug-and-run on a clean machine. Re-running is cheap:
+  # `ollama pull` is a no-op once the blobs are in the named volume.
+  model-init:
+    image: ollama/ollama:latest
+    container_name: ai-model-init
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+    entrypoint: ["sh", "-c",
+      "ollama pull ${OLLAMA_MODEL:-qwen3:8b} && ollama pull ${JUDGE_MODEL:-qwen2.5:7b-instruct}"]
+    restart: "no"
+    networks: [ai_net]
+
   # ── FastAPI backend ───────────────────────────────────────────────────────────
   backend:
     build:
@@ -50,8 +95,9 @@ services:
     environment:
       - NEO4J_URI=bolt://neo4j:7687
       - MONGO_URI=${MONGO_URI_DOCKER:-mongodb://mongo:27017/}
-      # Ollama runs on the host for GPU access; install it + `ollama serve` there.
-      - OLLAMA_HOST=${OLLAMA_HOST_DOCKER:-http://host.docker.internal:11434}
+      # Ollama is containerised (service `ollama`). Override OLLAMA_HOST_DOCKER
+      # in .env to use a host install instead.
+      - OLLAMA_HOST=${OLLAMA_HOST_DOCKER:-http://ollama:11434}
       - PYTHONUNBUFFERED=1
       - MLFLOW_TRACKING_URI=sqlite:////app/mlflow.db
     volumes:
@@ -62,6 +108,8 @@ services:
         condition: service_healthy
       mongo:
         condition: service_started
+      ollama:
+        condition: service_healthy
     restart: unless-stopped
     extra_hosts:
       - "host.docker.internal:host-gateway"
@@ -92,6 +140,7 @@ volumes:
   neo4j_data:
   mongo_data:
   hf_cache:
+  ollama_models:
 
 networks:
   ai_net:

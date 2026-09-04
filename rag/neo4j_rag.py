@@ -37,6 +37,7 @@ Environment variables (.env)
 
 import os
 import re
+import sys
 import json
 from datetime import datetime
 from typing import List, Dict, Any, Optional
@@ -93,8 +94,22 @@ ISSUE_KEY_PATTERN = re.compile(r'\b([A-Z][A-Z0-9]+-\d+)\b')
 
 
 def log(msg: str, level: str = "INFO") -> None:
+    """Print a timestamped line, surviving consoles that cannot encode it.
+
+    On Windows the default console encoding is cp1252, which has no glyph for
+    the check marks used in the start-up banner below. A bare print() therefore
+    raises UnicodeEncodeError from inside RAGGenerator.__init__, the exception
+    propagates, and the caller sees `rag = None` -- retrieval silently returns
+    zero sources and every answer becomes a refusal. Losing a tick mark is
+    acceptable; losing retrieval is not.
+    """
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{ts}] [{level}] {msg}", flush=True)
+    line = f"[{ts}] [{level}] {msg}"
+    try:
+        print(line, flush=True)
+    except UnicodeEncodeError:
+        enc = (getattr(sys.stdout, "encoding", None) or "ascii")
+        print(line.encode(enc, "replace").decode(enc, "replace"), flush=True)
 
 
 # ── Cypher ─────────────────────────────────────────────────────────────────────

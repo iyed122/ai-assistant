@@ -46,6 +46,7 @@ WHAT CHANGED vs rag_generator.py  (see DIAGNOSIS.md)
 
 import os
 import re
+import sys
 import json
 import time
 import logging
@@ -95,8 +96,22 @@ logger = logging.getLogger("rag_generator_test")
 
 
 def log(message: str, level: str = "INFO"):
+    """Print a timestamped line, surviving consoles that cannot encode it.
+
+    The start-up banner uses check marks, and Windows consoles default to
+    cp1252, which has no glyph for them. An unguarded print() raises
+    UnicodeEncodeError from inside RAGGenerator.__init__; the caller then sees
+    `rag = None`, retrieval returns zero sources, and every answer becomes a
+    refusal with no obvious cause. Losing a tick mark is acceptable; losing
+    retrieval is not.
+    """
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{timestamp}] [{level}] {message}")
+    line = f"[{timestamp}] [{level}] {message}"
+    try:
+        print(line)
+    except UnicodeEncodeError:
+        enc = (getattr(sys.stdout, "encoding", None) or "ascii")
+        print(line.encode(enc, "replace").decode(enc, "replace"))
 
 
 # Direct, indexed ticket fetch — bypasses embedding/ANN for explicitly named keys.

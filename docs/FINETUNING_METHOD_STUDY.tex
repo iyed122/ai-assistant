@@ -1,0 +1,243 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[margin=2.2cm]{geometry}
+\usepackage{tabularx}
+\usepackage{booktabs}
+\usepackage{xcolor}
+\usepackage{colortbl}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{longtable}
+\hypersetup{colorlinks=true,linkcolor=black,urlcolor=blue!60!black}
+
+\definecolor{hdr}{RGB}{28,42,64}
+\definecolor{rowgray}{RGB}{243,245,248}
+\definecolor{good}{RGB}{20,110,60}
+\definecolor{bad}{RGB}{160,35,35}
+
+\newcolumntype{Y}{>{\raggedright\arraybackslash}X}
+\newcommand{\yes}{\textcolor{good}{\textbf{yes}}}
+\newcommand{\no}{\textcolor{bad}{\textbf{no}}}
+
+\title{\vspace{-1.5cm}\textbf{Choosing a Fine-Tuning Method for a Graph-RAG\\Enterprise Assistant}\\[0.3cm]
+\large A measured comparison against this system's own evaluation data}
+\author{Prepared for Iyed Mediouni --- PFE, TEK-UP $\times$ TELNET Holding}
+\date{15 August 2026}
+
+\begin{document}
+\maketitle
+\vspace{-0.8cm}
+
+\section*{Purpose}
+This report decides which fine-tuning method --- if any --- is justified for the assistant, using
+evidence measured on this system rather than general claims. It scores every candidate against
+constraints that emerged during development, including the supervising professor's position that
+code fixes remove the need for fine-tuning.
+
+\section{A distinction that changes the question}
+
+\textbf{RAFT is not an alternative to QLoRA.} They sit on different axes:
+
+\begin{itemize}[leftmargin=1.2em,itemsep=2pt]
+  \item \textbf{Training objective / data recipe} --- what the model is taught:
+        SFT, RAFT, DPO, ORPO, KTO, SimPO, GRPO, RLHF.
+  \item \textbf{Parameter-efficiency method} --- how the weights are updated:
+        full fine-tuning, LoRA, QLoRA, DoRA, GaLore.
+\end{itemize}
+
+RAFT is run \emph{with} QLoRA. The choice is therefore not ``RAFT or QLoRA'' but
+``which objective, executed with which parameter method''. This matters for the defence: a jury
+member who knows the field will notice the conflation immediately.
+
+\section{Timeline of the techniques considered}
+
+\begin{table}[h]\centering\small
+\begin{tabularx}{\textwidth}{l l Y}
+\toprule
+\textbf{Year} & \textbf{Technique} & \textbf{Contribution} \\
+\midrule
+2021 & LoRA & Low-rank adapters; freezes the base model (Microsoft) \\
+\rowcolor{rowgray} 2022 & RLHF / PPO & Preference alignment via a learned reward model (InstructGPT) \\
+2023 & QLoRA & 4-bit NF4 base + LoRA; 65B-class tuning on one GPU (U.~Washington) \\
+\rowcolor{rowgray} 2023 & DPO & Preference tuning without a reward model (Stanford) \\
+2024 & RAFT & SFT with distractor documents + cited chain-of-thought (UC Berkeley/Microsoft) \\
+\rowcolor{rowgray} 2024 & DoRA & Splits updates into magnitude and direction; $+1$--$4.4\%$ over LoRA (NVIDIA) \\
+2024 & KTO / ORPO / SimPO & Preference variants; ORPO merges SFT and DPO into one stage \\
+\rowcolor{rowgray} 2024--25 & GRPO & Group-relative RL for verifiable rewards; popularised by DeepSeek-R1 \\
+2025 & GraphRAFT & RAFT for knowledge graphs; trains correct graph-query generation \\
+\rowcolor{rowgray} 2025 & DTA (Divide-Then-Align) & Four knowledge quadrants; teaches calibrated ``I don't know'' (ACL 2025) \\
+2025 & CRAFT / ALoFTRAG / RbFT & Compute-efficient, local-only and noise-robust RAFT variants \\
+\rowcolor{rowgray} 2026 & TRL v1.0 & One library unifying SFT/DPO/KTO/ORPO/GRPO trainers (April 2026) \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\section{What this system actually measured}
+
+Every score below is anchored on these figures, obtained on this assistant's own corpus.
+
+\begin{table}[h]\centering\small
+\begin{tabularx}{\textwidth}{Y r}
+\toprule
+\textbf{Observation} & \textbf{Value} \\
+\midrule
+Judged benchmark records (RAGAS + validator, no approximations) & 299 \\
+\rowcolor{rowgray} Faithfulness $<0.70$ & 13.7\,\% $\pm$ 3.9 \\
+Quality grades GOLD / SILVER / BRONZE / FAILED & 229 / 51 / 16 / 3 \\
+\rowcolor{rowgray} Fabrication defects (deterministic validator, checkable answers) & 10.0\,\% local, 7.1\,\% fp16 \\
+Share of fabrication defects that are invented URLs & $\approx$95\,\% \\
+\rowcolor{rowgray} Overlap between validator-detected and judge-detected defects & 3 of 63 \\
+Refusals that are ``bare'' (decline, offer nothing usable) & 41\,\% -- 57\,\% \\
+\rowcolor{rowgray} Adapter~1 (DPO, 188 pairs): gate verdict & \textbf{REJECTED} \\
+\quad source coverage 11.5\,\% $\rightarrow$ 16.4\,\%, refusals 75.4\,\% $\rightarrow$ 93.4\,\% (rule D8 tripped) & \\
+\rowcolor{rowgray} Natural preference pairs available (real text on both sides) & 96 \\
+On-policy SFT demonstrations available & 419 \\
+Retrieval demonstrably returns distractors (asked 4.16.0; returned 4.16.1, 4.28.0) & yes \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\section{Scoring rubric}
+
+Criteria are taken from constraints stated during this project, not invented for the report.
+Each method scores 0--5 per criterion; the weight reflects how decisive that criterion is here.
+
+\begin{table}[h]\centering\small
+\begin{tabularx}{\textwidth}{c Y c}
+\toprule
+\textbf{\#} & \textbf{Criterion} & \textbf{Weight} \\
+\midrule
+C1 & \textbf{Not achievable by a code fix.} The professor's position: if a filter fixes it, weights should not. & $\times$3 \\
+\rowcolor{rowgray} C2 & \textbf{Targets a defect measured in this system}, not a generic weakness. & $\times$3 \\
+C3 & \textbf{Training data exists without synthesis.} A pool that is 93\,\% corrupted answers is weak evidence. & $\times$2 \\
+\rowcolor{rowgray} C4 & \textbf{Improvement is detectable} on the available holdout with free, deterministic metrics. & $\times$2 \\
+C5 & \textbf{Runs from the existing UI} without new training code. & $\times$2 \\
+\rowcolor{rowgray} C6 & \textbf{Fits the compute budget} (6\,GB local; Kaggle T4$\times$2, 30\,h/week). & $\times$1 \\
+C7 & \textbf{Defensible to a jury} --- published, citable, reproducible. & $\times$2 \\
+\rowcolor{rowgray} C8 & \textbf{Matches the stated product preference}: a clean ``not available'' beats a tangential citation. & $\times$2 \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\section{Scored comparison}
+
+\begin{table}[h]\centering\footnotesize
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{l ccccccc c r}
+\toprule
+\textbf{Method (objective)} & \textbf{C1} & \textbf{C2} & \textbf{C3} & \textbf{C4} & \textbf{C5} & \textbf{C6} & \textbf{C7} & \textbf{C8} & \textbf{Total} \\
+ & $\times$3 & $\times$3 & $\times$2 & $\times$2 & $\times$2 & $\times$1 & $\times$2 & $\times$2 & /85 \\
+\midrule
+Vanilla SFT (QLoRA) on GOLD answers & 2 & 1 & 4 & 2 & 5 & 5 & 3 & 2 & \textbf{47} \\
+\rowcolor{rowgray} DPO on corruption pairs \emph{(built, rejected)} & 1 & 2 & 1 & 2 & 5 & 5 & 3 & 2 & \textbf{41} \\
+DPO on the 96 natural pairs & 3 & 3 & 5 & 2 & 5 & 5 & 3 & 3 & \textbf{57} \\
+\rowcolor{rowgray} ORPO / SimPO / KTO & 3 & 2 & 4 & 2 & 2 & 4 & 4 & 3 & \textbf{48} \\
+GRPO (verifiable reward) & 4 & 2 & 5 & 3 & 1 & 1 & 4 & 3 & \textbf{50} \\
+\rowcolor{rowgray} RLHF / PPO + reward model & 4 & 2 & 1 & 3 & 1 & 1 & 4 & 3 & \textbf{42} \\
+\textbf{RAFT (SFT + distractors + cited CoT)} & 5 & 5 & 4 & 4 & 5 & 4 & 5 & 3 & \textbf{74} \\
+\rowcolor{rowgray} \textbf{RAFT $\rightarrow$ DTA (two stage)} & 5 & 5 & 4 & 4 & 5 & 4 & 5 & 5 & \textbf{78} \\
+GraphRAFT & 5 & 4 & 2 & 3 & 3 & 3 & 4 & 3 & \textbf{63} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent\textit{Parameter-efficiency axis:} QLoRA (2023) remains correct here --- 8B model, 6\,GB local
+VRAM, T4 on Kaggle, and adapters that swap at serve time. DoRA (2024) offers $+1$--$4.4\%$ over LoRA
+and is a drop-in upgrade, but it changes nothing about which objective to choose.
+
+\section{Why the two leaders win}
+
+\subsection*{RAFT (2024) --- scores 74}
+
+RAFT trains the model on a question plus a \emph{golden} document and several \emph{distractor}
+documents, with a chain-of-thought answer that quotes the supporting span verbatim. In a fraction
+$(1-P)$ of examples the golden document is withheld entirely.
+
+It scores highest on C1 and C2 because it targets a defect this system demonstrably has and no
+filter can repair: \textbf{choosing correctly among retrieved documents}. When the assistant was
+asked about ``Release notes 4.16.0'' and retrieval returned 4.16.1 and 4.28.0, the decision of what
+to do with those near-misses is a model behaviour, not a string operation.
+
+The published results also supply the strongest single argument against the ``just fix the code''
+position: in the RAFT paper, \textbf{domain fine-tuning plus RAG is often worse than domain
+fine-tuning alone} (HuggingFace 61.06 $\rightarrow$ 42.59; TensorFlow 86.56 $\rightarrow$ 60.29).
+The interaction between tuning and retrieval is a genuine research problem, and RAFT is the
+published remedy --- gains of up to 35 points over base+RAG on HotpotQA.
+
+\subsection*{DTA / Divide-Then-Align (ACL 2025) --- lifts the total to 78}
+
+RAFT has a documented weakness: it conditions models to answer even when the context is entirely
+noise, which raises hallucination risk. DTA addresses exactly this. It divides samples into four
+quadrants by whether the answer is available in the retrieved passages and in the model's internal
+knowledge, then builds preference data per quadrant so the model learns to reply
+\emph{``I don't know''} when the query falls outside both boundaries.
+
+This is the only candidate that scores 5 on C8, because it optimises for the behaviour already
+stated as preferred: a clean, short ``the data is not there'' rather than a citation of something
+adjacent. It uses \textbf{DPO} --- so the method is not rejected, only redirected: the earlier
+failure came from building preference pairs by corrupting answers, not from DPO itself.
+
+\section{UI integration}
+
+\begin{table}[h]\centering\small
+\begin{tabularx}{\textwidth}{l c Y}
+\toprule
+\textbf{Method} & \textbf{New trainer?} & \textbf{What changes} \\
+\midrule
+RAFT & \no & Uses the existing \texttt{qlora} path; only the dataset builder differs \\
+\rowcolor{rowgray} DTA & \no & Uses the existing \texttt{dpo} path; only the dataset builder differs \\
+GRPO / RLHF & \yes & New trainer, reward plumbing, online rollouts \\
+\rowcolor{rowgray} ORPO / SimPO / KTO & \yes & New TRL trainer classes to wire in \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+The training panel already exposes \texttt{method: [qlora, dpo, sequential]}, logs to MLflow, and can
+activate an adapter as \texttt{FROM qwen3:8b + ADAPTER}. RAFT and DTA therefore require
+\textbf{no new training code} --- they are data recipes that run through paths that already exist and
+are already reachable from the interface. Every other candidate requires a new trainer.
+
+\section{Recommendation}
+
+\begin{enumerate}[leftmargin=1.4em,itemsep=3pt]
+  \item \textbf{Adopt RAFT as the training objective, executed with QLoRA.} It is the only method
+        scoring 5 on both ``no code fix can do this'' and ``targets a measured defect''.
+  \item \textbf{Follow with a DTA stage on the existing \texttt{dpo} path} if time allows, to hold the
+        abstention behaviour that is preferred for this product.
+  \item \textbf{Reject GRPO, RLHF and a learned reward model} --- and say why: the reward signal here
+        is already exact, deterministic and free (refusal classifier plus validator penalties). A
+        learned reward model would add compute and approximation error where an exact reward exists.
+  \item \textbf{Do the code fix as well.} Filtering links absent from the context is cheaper and more
+        reliable than any weight update, and implementing it strengthens rather than weakens the
+        argument for fine-tuning what remains.
+\end{enumerate}
+
+\section{Risks and honest limitations}
+
+\begin{itemize}[leftmargin=1.2em,itemsep=2pt]
+  \item RAFT's reported gains come from PubMed, HotpotQA and Gorilla --- not from this corpus.
+        Transfer is plausible, not guaranteed.
+  \item Generating cited chain-of-thought answers requires a stronger model for the training data
+        (the paper used GPT-4-1106; the local equivalent here is the hosted judge), which reintroduces
+        a quota dependency for dataset construction, though not for evaluation.
+  \item The gate may still reject the result. That outcome remains a legitimate finding, and the
+        first rejection is already documented with a diagnosed cause.
+\end{itemize}
+
+\section*{References}
+\small
+\begin{itemize}[leftmargin=1.2em,itemsep=1pt]
+  \item Hu et al. \textit{LoRA: Low-Rank Adaptation of Large Language Models}, 2021.
+  \item Ouyang et al. \textit{Training language models to follow instructions with human feedback} (InstructGPT), 2022.
+  \item Dettmers et al. \textit{QLoRA: Efficient Finetuning of Quantized LLMs}, 2023.
+  \item Rafailov et al. \textit{Direct Preference Optimization}, 2023.
+  \item Zhang, Patil et al. \textit{RAFT: Adapting Language Model to Domain Specific RAG}, 2024. \url{https://arxiv.org/abs/2403.10131}
+  \item Liu et al. \textit{DoRA: Weight-Decomposed Low-Rank Adaptation}, 2024.
+  \item Shao et al. \textit{DeepSeekMath} (GRPO), 2024; popularised by DeepSeek-R1, 2025.
+  \item \textit{Divide-Then-Align: Honest Alignment based on the Knowledge Boundary of RAG}, ACL 2025. \url{https://arxiv.org/pdf/2505.20871}
+  \item Joren et al. \textit{Sufficient Context: A New Lens on Retrieval Augmented Generation}, 2024. \url{https://arxiv.org/pdf/2411.06037}
+  \item \textit{Let Them Down Easy! Contextual Effects of LLM Guardrails}, EMNLP Findings 2025. \url{https://arxiv.org/abs/2506.00195}
+\end{itemize}
+
+\end{document}

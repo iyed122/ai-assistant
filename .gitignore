@@ -59,3 +59,30 @@ setup_github.ps1
 Thumbs.db
 .DS_Store
 *.log
+
+# Kaggle API tokens - never commit
+env.kaggle.txt
+kaggle_iyed_api.txt
+*_api.txt
+
+# ── keep the public repo to source and documentation ────────────────────────
+# Session/tooling state
+.claude/
+
+# Large binaries and archives: demo captures, LaTeX bundles, adapter dumps
+*.mp4
+*.zip
+docs/demo_capture/
+docs/screenshots/
+
+# Separate projects that live in their own repositories
+portfolio/
+iyed122.github.io/
+
+# Training artefacts and evaluation payloads. These embed client document text
+# and are reproducible from the pipeline, so they are deliberately not shipped.
+training/export/
+training/snapshots/
+datasets/
+mlruns/
+*.db

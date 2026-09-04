@@ -86,9 +86,17 @@ MODEL_REGISTRY  = os.getenv("MLFLOW_MODEL_NAME",   "weaver-qwen")
 class TrainConfig:
     """All hyperparams in one place — serializable to/from JSON."""
 
-    # Model
-    base_model:          str   = HF_MODEL_ID       # AWQ = ~4 GB download (not 15 GB)
-    method:              str   = "qlora"           # qlora | dpo | sequential
+    # Model. Defaults to the Hugging Face checkpoint behind whatever Ollama is
+    # serving, so an adapter trained here can actually be attached to it. Falls
+    # back to HF_MODEL_ID when the Ollama tag is not one we can map.
+    base_model:          str   = field(
+        default_factory=lambda: hf_base_for_ollama() or HF_MODEL_ID)
+    method:              str   = "qlora"           # qlora | raft | dpo | sequential
+
+    # Spill to system RAM rather than failing when the model exceeds VRAM. Slow,
+    # but it lets a 6 GB card train an 8B base instead of refusing outright.
+    allow_cpu_offload:   bool  = True
+    cpu_offload_gb:      int   = 24
 
     # LoRA
     lora_rank:           int   = 16
@@ -151,6 +159,44 @@ def _get_db():
 def _query_hash(query: str) -> str:
     """Stable hash for deduplication."""
     return hashlib.md5(query.strip().lower().encode()).hexdigest()
+
+
+def hf_base_for_ollama(serve_model: str = OLLAMA_MODEL) -> Optional[str]:
+    """
+    The Hugging Face base that corresponds to the model Ollama serves.
+
+    A LoRA adapter only loads into the exact architecture and size it was trained
+    on, so the training base is not a free choice: it is dictated by whatever
+    OLLAMA_MODEL is. Deriving it here means the two cannot drift apart, which they
+    silently had -- the default trained Qwen2.5-3B while Ollama served qwen3:8b,
+    producing adapters that could never be deployed.
+
+    Note that training does NOT read Ollama's weights. Ollama stores q4_K_M GGUF;
+    PEFT trains on Hugging Face weights. What this returns is the upstream
+    checkpoint the Ollama tag was built from, so the resulting adapter attaches
+    cleanly to the served model afterwards.
+    """
+    import re
+
+    if not serve_model:
+        return None
+    tag = serve_model.split(":")[0].strip().lower()
+    size = serve_model.split(":")[1].strip().lower() if ":" in serve_model else ""
+    size = size.replace("-instruct", "").replace("b", "B")
+
+    known = {
+        "qwen3":   "Qwen/Qwen3-{size}",
+        "qwen2.5": "Qwen/Qwen2.5-{size}-Instruct",
+        "qwen2":   "Qwen/Qwen2-{size}-Instruct",
+        "llama3.1": "meta-llama/Llama-3.1-{size}-Instruct",
+        "mistral": "mistralai/Mistral-{size}-Instruct-v0.3",
+    }
+    template = known.get(tag)
+    # "latest" and other non-numeric tags carry no size, and guessing one would
+    # produce a repo id that does not exist (mistralai/Mistral-latest-...).
+    if not template or not re.fullmatch(r"\d+(?:\.\d+)?B", size or ""):
+        return None
+    return template.format(size=size)
 
 
 def check_base_model_compat(
@@ -462,12 +508,20 @@ class TrainingCallback:
                 mlflow.log_metric(f"final_{k}", v)
 
 
-def train_qlora_sft(config: TrainConfig, callback: Optional[TrainingCallback] = None):
+def train_qlora_sft(config: TrainConfig, callback: Optional[TrainingCallback] = None,
+                    dataset_stem: str = "qlora"):
     """
     QLoRA Supervised Fine-Tuning.
 
     Loads the base model in 4-bit, attaches LoRA adapters, trains on
     the ChatML-formatted QLoRA dataset.
+
+    `dataset_stem` selects which prepared dataset to train on, so an alternative
+    data recipe can reuse this trainer unchanged. RAFT is exactly that case: it
+    is supervised fine-tuning, and only the composition of the training examples
+    differs (golden passage among distractors, answers that quote their source).
+    Duplicating the trainer to change one filename would guarantee the two copies
+    drift apart.
 
     Memory budget (RTX 3050, 6 GB):
       4-bit model ~4 GB + LoRA ~0.1 GB + optimizer ~0.2 GB
@@ -494,8 +548,8 @@ def train_qlora_sft(config: TrainConfig, callback: Optional[TrainingCallback] = 
              config.base_model, config.lora_rank, config.learning_rate, config.epochs)
 
     # ── Load dataset ────────────────────────────────────────────────────────
-    train_path = str(DATASET_DIR / "qlora_train.jsonl")
-    eval_path  = str(DATASET_DIR / "qlora_eval.jsonl")
+    train_path = str(DATASET_DIR / f"{dataset_stem}_train.jsonl")
+    eval_path  = str(DATASET_DIR / f"{dataset_stem}_eval.jsonl")
 
     if not Path(train_path).exists():
         raise FileNotFoundError(
@@ -513,6 +567,25 @@ def train_qlora_sft(config: TrainConfig, callback: Optional[TrainingCallback] = 
         "dataset_eval_size":  len(dataset_eval) if dataset_eval else 0,
     })
 
+    # ── Can this environment actually load the requested base? ──────────────
+    # base_model now follows OLLAMA_MODEL, which is correct but means it can name
+    # an architecture the installed transformers predates -- Qwen3 needs >= 4.51,
+    # and the failure is otherwise a bare ValueError about an unrecognised model
+    # type. Say what is wrong and what to do about it.
+    from transformers import AutoConfig
+    try:
+        AutoConfig.from_pretrained(config.base_model, trust_remote_code=True)
+    except Exception as e:
+        import transformers as _tf
+        raise RuntimeError(
+            f"transformers {_tf.__version__} in this environment cannot load "
+            f"'{config.base_model}' ({type(e).__name__}). That base was derived from "
+            f"OLLAMA_MODEL={OLLAMA_MODEL} so the adapter will attach to the served "
+            f"model. Either install transformers>=4.51 in the training environment, "
+            f"or set HF_MODEL_ID to a base this version supports -- noting that an "
+            f"adapter trained on a different architecture cannot be served."
+        ) from e
+
     # ── Tokenizer ───────────────────────────────────────────────────────────
     tokenizer = AutoTokenizer.from_pretrained(config.base_model, trust_remote_code=True)
     if tokenizer.pad_token is None:
@@ -521,12 +594,33 @@ def train_qlora_sft(config: TrainConfig, callback: Optional[TrainingCallback] = 
     # ── Load model (pre-quantized bnb-4bit) ─────────────────────────────────
     log.info("Loading %s ...", config.base_model)
 
+    # device_map="auto" with an explicit budget lets a model larger than the card
+    # spill into system RAM instead of raising OutOfMemoryError. Training that way
+    # is slow -- every offloaded layer crosses PCIe twice per step -- but on a 6 GB
+    # card it is the difference between "runs overnight" and "does not run at all".
+    # The GPU budget is pinned below physical VRAM so activations still have room.
+    _dev_map, _max_mem = {"": 0}, None
+    if torch.cuda.is_available() and config.allow_cpu_offload:
+        _vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+        _budget = max(1, int(_vram_gb) - 1)
+        _dev_map = "auto"
+        _max_mem = {0: f"{_budget}GiB", "cpu": f"{config.cpu_offload_gb}GiB"}
+        log.warning("CPU offload enabled: GPU budget %dGiB, CPU %dGiB. Expect training "
+                    "to be many times slower than a GPU-resident run.",
+                    _budget, config.cpu_offload_gb)
+
     model = AutoModelForCausalLM.from_pretrained(
         config.base_model,
-        device_map={"": 0},
+        device_map=_dev_map,
+        max_memory=_max_mem,
         trust_remote_code=True,
     )
-    model = prepare_model_for_kbit_training(model)
+    # The non-reentrant variant is required for PEFT; see the training args below.
+    model = prepare_model_for_kbit_training(
+        model,
+        use_gradient_checkpointing=config.gradient_checkpointing,
+        gradient_checkpointing_kwargs={"use_reentrant": False},
+    )
 
     # ── LoRA config ─────────────────────────────────────────────────────────
     lora_config = LoraConfig(
@@ -561,8 +655,17 @@ def train_qlora_sft(config: TrainConfig, callback: Optional[TrainingCallback] = 
         fp16=config.fp16,
         bf16=config.bf16,
         gradient_checkpointing=config.gradient_checkpointing,
+        # MANDATORY with PEFT. Under the default (use_reentrant=True) the
+        # checkpointed segments do not track gradients correctly for inputs that
+        # were made to require grad by prepare_model_for_kbit_training, and the
+        # loss goes silently NaN within about three optimizer steps. It cost eight
+        # runs to find; it must never be left to the default here.
+        gradient_checkpointing_kwargs={"use_reentrant": False},
         optim=config.optim,
         logging_steps=1,
+        # Default True rewrites NaN/Inf losses to 0.0 in the log, so a dead run
+        # reports a beautiful loss curve and a mean of 0.04. Never on.
+        logging_nan_inf_filter=False,
         eval_strategy=config.eval_strategy if dataset_eval else "no",
         save_strategy="epoch",
         save_total_limit=3,
@@ -590,6 +693,26 @@ def train_qlora_sft(config: TrainConfig, callback: Optional[TrainingCallback] = 
         text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
         return text
 
+    # ── Pre-flight: every example must keep some answer to learn from ───────
+    # An example whose prompt alone fills max_seq_length has no supervised tokens
+    # left, contributes 0/0 to the loss, and poisons the weights with NaN. Checked
+    # before the GPU is committed: this costs seconds and has already been the
+    # difference between a dead adapter and a working one.
+    _over, _worst = 0, 0
+    for _ex in dataset_train:
+        _n = len(tokenizer(formatting_func(_ex)).input_ids)
+        _worst = max(_worst, _n)
+        if _n > config.max_seq_length:
+            _over += 1
+    log.info("Pre-flight: longest example %d tokens, max_seq_length %d, %d/%d over",
+             _worst, config.max_seq_length, _over, len(dataset_train))
+    if _over:
+        raise ValueError(
+            f"{_over} of {len(dataset_train)} examples exceed max_seq_length="
+            f"{config.max_seq_length} (longest is {_worst} tokens). Training on "
+            f"these would silently discard their answers. Raise max_seq_length to "
+            f"at least {_worst}, or shorten the prompts.")
+
     # ── Train ───────────────────────────────────────────────────────────────
     trainer = SFTTrainer(
         model=model,
@@ -609,6 +732,30 @@ def train_qlora_sft(config: TrainConfig, callback: Optional[TrainingCallback] = 
     model.save_pretrained(str(adapter_path))
     tokenizer.save_pretrained(str(adapter_path))
     log.info("Adapter saved → %s", adapter_path)
+
+    # ── Health check: a diverged run still writes a plausible-looking file ──
+    # One completed run reported train_loss 0.0415 and stopped_early=False while
+    # 497 of its 504 tensors were NaN. "It finished" is not evidence of anything,
+    # so the file is inspected before anyone is told the training succeeded.
+    import safetensors.torch as _st
+    _w = _st.load_file(str(adapter_path / "adapter_model.safetensors"))
+    _nan = sum(1 for t in _w.values() if torch.isnan(t).any())
+    _inf = sum(1 for t in _w.values() if torch.isinf(t).any())
+    _B = [t for k, t in _w.items() if "lora_B" in k]
+    _live = sum(1 for t in _B if not torch.isnan(t).any() and float(t.abs().sum()) > 0)
+    log.info("Adapter health: %d tensors | NaN %d | Inf %d | lora_B live %d/%d",
+             len(_w), _nan, _inf, _live, len(_B))
+    mlflow.log_metric("adapter_nan_tensors", _nan)
+    mlflow.log_metric("adapter_inf_tensors", _inf)
+    mlflow.log_metric("adapter_lora_b_live", _live)
+    if _nan or _inf:
+        raise ValueError(
+            f"Adapter is unusable: {_nan} tensors contain NaN and {_inf} contain Inf. "
+            f"The run diverged. Do not evaluate or promote this adapter.")
+    if _live != len(_B):
+        raise ValueError(
+            f"Only {_live} of {len(_B)} lora_B tensors are non-zero — those layers "
+            f"learned nothing. Do not promote this adapter.")
 
     # ── Log to MLflow ───────────────────────────────────────────────────────
     final_metrics = {
@@ -801,6 +948,42 @@ def train_dpo(config: TrainConfig, sft_adapter_path: Optional[str] = None,
 # ═════════════════════════════════════════════════════════════════════════════
 # Stage 2c — Sequential (SFT → DPO)
 # ═════════════════════════════════════════════════════════════════════════════
+
+def train_raft(config: TrainConfig, callback: Optional[TrainingCallback] = None):
+    """
+    RAFT — Retrieval-Augmented Fine-Tuning (Zhang, Patil et al., UC Berkeley, 2024).
+
+    Mechanically this is supervised fine-tuning; what makes it RAFT is the data.
+    Each example presents the question with a golden passage AND several
+    distractor passages, and the target answer reasons explicitly, quoting its
+    supporting span verbatim. In a fraction of examples the golden passage is
+    withheld, which is what teaches the model to abstain rather than to answer
+    from whatever happens to be in front of it.
+
+    It is the right objective for this assistant because retrieval here returns
+    near-misses: asked about release 4.16.0, the graph search returns 4.16.1 and
+    4.28.0. Choosing correctly among them is a model behaviour, and no
+    post-processing filter can supply it.
+
+    Reads training/datasets/raft_train.jsonl, produced by the RAFT dataset
+    builder rather than by `prepare`.
+
+    RAFT prompts are far longer than ordinary SFT prompts -- a question plus a
+    golden passage plus three distractors runs to a median of ~1,730 tokens and a
+    maximum of 3,071. The default max_seq_length of 1024 would truncate the
+    assistant's answer off the end of nearly every example, leaving zero
+    supervised tokens and a loss of 0/0. Raise it here rather than expecting
+    whoever presses the button to know that.
+    """
+    RAFT_MIN_SEQ = 3072
+    if config.max_seq_length < RAFT_MIN_SEQ:
+        log.warning("RAFT: raising max_seq_length %d -> %d (RAFT prompts reach 3071 "
+                    "tokens; a shorter window trains on truncated examples)",
+                    config.max_seq_length, RAFT_MIN_SEQ)
+        config.max_seq_length = RAFT_MIN_SEQ
+
+    return train_qlora_sft(config, callback, dataset_stem="raft")
+
 
 def train_sequential(config: TrainConfig, callback: Optional[TrainingCallback] = None):
     """Run SFT first, then DPO on top of the SFT adapter."""
@@ -1042,7 +1225,11 @@ def main():
 
     # train
     p_train = sub.add_parser("train", help="Run training")
-    p_train.add_argument("--method", choices=["qlora", "dpo", "sequential"], default="qlora")
+    p_train.add_argument("--method",
+                         choices=["raft", "qlora", "sequential"],
+                         default="raft",
+                         help="Training objective. RAFT is the project's method; "
+                              "qlora is the plain supervised substrate it builds on.")
     p_train.add_argument("--config", type=str, default=None, help="Path to config JSON")
     p_train.add_argument("--rank", type=int, default=16)
     p_train.add_argument("--lr", type=float, default=2e-4)
@@ -1079,6 +1266,8 @@ def main():
 
         if config.method == "qlora":
             result = train_qlora_sft(config)
+        elif config.method == "raft":
+            result = train_raft(config)
         elif config.method == "dpo":
             result = train_dpo(config)
         elif config.method == "sequential":

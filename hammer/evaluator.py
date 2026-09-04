@@ -263,15 +263,125 @@ _ragas_llm_inst = None
 _ragas_emb_inst = None
 
 
+# Hosted judge (optional). When JUDGE_API_KEY is present the evaluator uses a
+# hosted OpenAI-compatible endpoint instead of local Ollama. Added because the
+# Ollama cloud judge has an account-level daily quota that halts scoring mid-run;
+# a hosted judge with its own allowance lets a full pass complete.
+#
+# Ollama remains the default, so the stack still runs with no external service.
+JUDGE_BASE_URL = os.getenv("JUDGE_BASE_URL", "https://api.groq.com/openai/v1")
+JUDGE_MODEL    = os.getenv("JUDGE_MODEL",    "llama-3.3-70b-versatile")
+
+# Accept any of the usual names so the key can live under whatever the operator
+# already called it. First non-empty wins.
+_JUDGE_KEY_VARS = ("JUDGE_API_KEY", "GROQ_API_KEY", "HF_TOKEN",
+                   "HUGGINGFACE_API_KEY", "hf_api", "HF_API",
+                   "OPENAI_API_KEY")
+JUDGE_API_KEY = next((os.getenv(v, "").strip() for v in _JUDGE_KEY_VARS
+                      if os.getenv(v, "").strip()), "")
+
+
+def _document_validation(doc: Dict[str, Any], query: str, answer: str,
+                         contexts: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
+    """
+    Run the deterministic document checks and return validator_details.
+
+    The evidence is whatever the model was actually shown: the passages RAGAS
+    scored against, falling back to stored snippets. Returns None when the
+    validator is unavailable or no evidence exists, so failure-tag derivation
+    degrades to its previous behaviour rather than inventing penalties.
+    """
+    try:
+        from hammer.validator import validate_document_answer
+    except Exception as exc:                      # validator optional by design
+        logger.debug("document validator unavailable: %s", exc)
+        return None
+
+    ctx_text = "\n\n".join(contexts or [])
+    if not ctx_text:
+        ctx_text = "\n\n".join(
+            s.get("text", "") for s in (doc.get("context_snippets") or []))
+    if not ctx_text.strip():
+        return None
+
+    try:
+        _score, details = validate_document_answer(
+            answer, ctx_text, doc.get("sources") or [], query)
+        return details
+    except Exception as exc:
+        logger.warning("document validation failed: %s", exc)
+        return None
+
+
+def _build_hosted_judge():
+    """RAGAS wrapper over an OpenAI-compatible hosted endpoint. None if unavailable."""
+    if not JUDGE_API_KEY:
+        return None
+    import importlib
+    for module_path in ("langchain_openai", "langchain_community.chat_models"):
+        try:
+            mod = importlib.import_module(module_path)
+            ChatOpenAI = getattr(mod, "ChatOpenAI")
+            from ragas.llms import LangchainLLMWrapper
+            llm = ChatOpenAI(
+                model=JUDGE_MODEL,
+                api_key=JUDGE_API_KEY,
+                base_url=JUDGE_BASE_URL,
+                temperature=0.0,
+                timeout=120,
+                max_retries=6,          # ride out transient rate limits
+            )
+            # RAGAS 0.1 asks the judge for several completions per call
+            # (answer_relevancy.strictness=3 -> n=3) for self-consistency.
+            # Ollama tolerates n>1; OpenAI-compatible hosted endpoints such as
+            # Groq reject it outright with
+            #     400 "'n' : number must be at most 1"
+            # which RAGAS surfaces as NaN, sending the evaluator silently down
+            # to the embedding approximation. Forcing single-sample mode keeps
+            # the metric working on hosted judges.
+            #
+            # Cost: answer_relevancy generates one candidate question instead of
+            # three, so it is slightly noisier per item. Recorded as a known
+            # deviation; it applies identically to every document scored this
+            # way, so before/after comparisons remain internally consistent.
+            try:
+                from ragas.metrics import answer_relevancy
+                if getattr(answer_relevancy, "strictness", 1) > 1:
+                    logger.info("hosted judge: answer_relevancy.strictness %s -> 1 (n>1 unsupported)",
+                                answer_relevancy.strictness)
+                    answer_relevancy.strictness = 1
+            except Exception:
+                pass
+
+            logger.info("RAGAS judge: %s via %s", JUDGE_MODEL, JUDGE_BASE_URL)
+            return LangchainLLMWrapper(llm)
+        except Exception as e:
+            logger.debug("hosted judge via %s failed: %s", module_path, e)
+            continue
+    logger.warning("JUDGE_API_KEY is set but no hosted-judge client could be built")
+    return None
+
+
 def _build_ragas_llm():
     global _ragas_llm_inst
     if _ragas_llm_inst is not None:
         return _ragas_llm_inst
     """
-    Build a RAGAS-compatible LLM wrapper backed by Ollama.
-    Tries langchain_community first, then langchain (older API).
-    Returns None if any import fails.
+    Build a RAGAS-compatible LLM wrapper.
+
+    Preference order:
+      1. Hosted OpenAI-compatible judge, when JUDGE_API_KEY / GROQ_API_KEY is set.
+      2. Local Ollama (default — keeps the stack self-contained).
+
+    Returns None if neither can be built, in which case scoring degrades to the
+    embedding approximation. That degradation is silent by design, so callers
+    must check `scoring_method` rather than trusting a completed run.
     """
+    hosted = _build_hosted_judge()
+    if hosted is not None:
+        _ragas_llm_inst = hosted
+        return _ragas_llm_inst
+
     for module_path in (
         "langchain_community.llms",
         "langchain.llms",
@@ -368,6 +478,94 @@ def _approx_answer_relevance(query: str, answer: str) -> float:
         return round(max(0.0, min(1.0, _cosine_sim(q_emb, a_emb))), 4)
     except Exception:
         return 0.5
+
+
+# ── Grounded-abstention credit ────────────────────────────────────────────────
+#
+# RAGAS answer_relevance works by generating questions from the answer and
+# comparing them to the original query.  A correct refusal — "the retrieved
+# context does not support this" — contains no content to generate from, so it
+# scores ~0.00.  That is a metric artefact, not a quality signal: declining to
+# fabricate is the desired behaviour, and it is what the DPO training targets.
+#
+# Left uncorrected the consequence is not cosmetic.  answer_relevance is 35% of
+# the weighted score, so correct refusals grade BRONZE/FAILED, are routed out of
+# the qlora_positive pool, and the model can never be reinforced for abstaining.
+#
+# This mirrors the existing faithfulness-floor correction below (a known RAGAS
+# misfire, conservatively corrected, with an audit flag).  Same discipline here:
+#   * fires ONLY when RAGAS returned a hard zero (< 0.05)
+#   * requires the answer to be grounded (faithfulness >= threshold), so a
+#     fabricating answer can never qualify
+#   * any fabrication-class validator penalty disqualifies it outright
+#   * the raw value and a flag are persisted, so every adjusted score is
+#     auditable and the aggregate can be recomputed without it
+#
+# Penalties are unaffected: source_coverage, jira_key_format, hallucination and
+# tool_misuse all still fire exactly as before.
+
+_ABSTENTION_RE = re.compile(
+    r"(context (provided |above )?does not"
+    r"|does not (contain|mention|support|provide|include|specify|cover)"
+    r"|no (relevant |specific |such )?(information|ticket|details?|documentation|reference)"
+    r"|not (possible|enough information) to (answer|determine)"
+    r"|cannot be (answered|determined|verified|confirmed)"
+    r"|unable to (answer|determine|find|locate)"
+    r"|is not (available|present|found) in the (provided |retrieved )?context)",
+    re.IGNORECASE,
+)
+
+# Validator checks that indicate the answer invented something.  Any of these
+# firing disqualifies the abstention credit.
+_FABRICATION_CHECKS = {
+    "source_coverage",
+    "jira_key_format",
+    "sentries_summary_coverage",
+    "round_stat_fabrication",
+    "url_validity",
+}
+
+ABSTENTION_AR_CREDIT   = float(os.getenv("ABSTENTION_AR_CREDIT",   "0.75"))
+ABSTENTION_MIN_FAITH   = float(os.getenv("ABSTENTION_MIN_FAITH",   "0.70"))
+ABSTENTION_RAW_CEILING = float(os.getenv("ABSTENTION_RAW_CEILING", "0.05"))
+
+
+def _is_grounded_abstention(
+    answer:       str,
+    faithfulness: Optional[float],
+    v_details:    Optional[Dict[str, Any]] = None,
+) -> bool:
+    """True when the model correctly declined instead of inventing an answer."""
+    if not answer or not _ABSTENTION_RE.search(answer):
+        return False
+    if faithfulness is None or faithfulness < ABSTENTION_MIN_FAITH:
+        return False                      # ungrounded → never eligible
+    for chk in (v_details or {}).get("checks", []):
+        if chk.get("name") in _FABRICATION_CHECKS and chk.get("penalty", 0) > 0:
+            return False                  # invented something → never eligible
+    return True
+
+
+def _apply_abstention_credit(
+    eval_doc:     Dict[str, Any],
+    answer:       str,
+    raw_ar:       float,
+    faithfulness: Optional[float],
+    v_details:    Optional[Dict[str, Any]] = None,
+) -> float:
+    """Return answer_relevance, substituting a defined credit for a correct refusal."""
+    eval_doc["abstention_credit"] = False
+    if raw_ar >= ABSTENTION_RAW_CEILING:
+        return raw_ar
+    if not _is_grounded_abstention(answer, faithfulness, v_details):
+        return raw_ar
+    eval_doc["answer_relevance_raw"] = raw_ar
+    eval_doc["abstention_credit"]    = True
+    logger.info(
+        "abstention credit: raw AR %.3f -> %.2f (grounded refusal, faith %.2f)",
+        raw_ar, ABSTENTION_AR_CREDIT, faithfulness or 0.0,
+    )
+    return ABSTENTION_AR_CREDIT
 
 
 def score_ragas(
@@ -724,6 +922,18 @@ CRITICAL_TAGS = {"hallucination", "tool_misuse", "retrieval_miss"}
 _HALLUCINATION_NOTES = {
     "fabricated_keys_on_empty_sentries",
     "jira_prefix_mismatch",
+    # v1.2 — documentation fabrication. The two above only match ticket traffic,
+    # so on rag-intent answers the hallucination tag could never fire. These are
+    # the equivalent deterministic catches for document-grounded answers: a
+    # version, config key, page title, quantity, ticket key or URL asserted in
+    # the answer that appears nowhere in the retrieved context.
+    "unsupported_versions",
+    "unsupported_identifiers",
+    "unsupported_quantities",
+    "unsupported_document_titles",
+    "unsupported_urls",
+    "fabricated_jira_keys",
+    "unsupported_gitlab_refs",
 }
 
 # Pre-compiled Jira-key regex (matches AUTH-12, PROJ-18208, LONGKEY-12355, etc.)
@@ -1057,7 +1267,10 @@ def evaluate_document(doc: Dict[str, Any]) -> Dict[str, Any]:
 
         rag_scores = score_ragas(query, answer, contexts)
         eval_doc["faithfulness"]     = _safe_float(rag_scores["faithfulness"])
-        eval_doc["answer_relevance"] = _safe_float(rag_scores["answer_relevance"])
+        eval_doc["answer_relevance"] = _apply_abstention_credit(
+            eval_doc, answer, _safe_float(rag_scores["answer_relevance"]),
+            eval_doc["faithfulness"], eval_doc.get("validator_details"),
+        )
         eval_doc["scoring_method"]   = rag_scores["method"]
 
         sources = doc.get("sources", [])
@@ -1066,6 +1279,20 @@ def evaluate_document(doc: Dict[str, Any]) -> Dict[str, Any]:
             eval_doc["graph_coverage"] = round(graph_count / len(sources), 4)
         else:
             eval_doc["graph_coverage"] = None
+
+        # Deterministic document validation (v1.2).
+        #
+        # Until now the rag branch ran RAGAS alone, so validator_details stayed
+        # empty and no failure tag could fire -- across 299 judged documentation
+        # answers, zero tags were raised. The checks that existed were written
+        # for ticket traffic and had no detector for an invented version, config
+        # key, page title, quantity or URL.
+        #
+        # This runs alongside RAGAS rather than replacing it: faithfulness stays
+        # the judge's, while these add checkable, quota-free evidence. Measured
+        # over the same 299 answers the two overlap on only 3 records, so they
+        # catch largely different defects.
+        eval_doc["validator_details"] = _document_validation(doc, query, answer, contexts)
 
     elif intent == "both":
         # HYBRID: answer draws from the live Sentries API *and* RAG context.
@@ -1143,13 +1370,16 @@ def evaluate_document(doc: Dict[str, Any]) -> Dict[str, Any]:
                 )
                 eval_doc["validator_details"] = v_details
             except ImportError:
-                v_score = 0.50
+                v_score   = 0.50
+                v_details = None
                 eval_doc["validator_details"] = None
 
             # Take max: if either ground-truth source endorses the answer,
             # it is faithful.  Store both for auditability.
             eval_doc["faithfulness"]     = max(v_score, ragas_faith)
-            eval_doc["answer_relevance"] = ragas_ar
+            eval_doc["answer_relevance"] = _apply_abstention_credit(
+                eval_doc, answer, ragas_ar, eval_doc["faithfulness"], v_details,
+            )
             eval_doc["scoring_method"]   = f"hybrid_{rag_scores['method']}"
             eval_doc["validator_faith"]  = v_score      # audit
             eval_doc["ragas_faith"]      = ragas_faith  # audit
@@ -1168,7 +1398,10 @@ def evaluate_document(doc: Dict[str, Any]) -> Dict[str, Any]:
                 faithfulness_floor_applied = True
 
             eval_doc["faithfulness"]              = ragas_faith
-            eval_doc["answer_relevance"]          = ragas_ar
+            eval_doc["answer_relevance"]          = _apply_abstention_credit(
+                eval_doc, answer, ragas_ar, ragas_faith,
+                eval_doc.get("validator_details"),
+            )
             eval_doc["scoring_method"]            = rag_scores["method"]
             eval_doc["faithfulness_floor_applied"] = faithfulness_floor_applied  # audit
 
@@ -1179,6 +1412,22 @@ def evaluate_document(doc: Dict[str, Any]) -> Dict[str, Any]:
             eval_doc["graph_coverage"] = round(graph_count / len(sources), 4)
         else:
             eval_doc["graph_coverage"] = None
+
+        # A hybrid answer can fail on either side: it may cite a ticket the API
+        # never returned, OR invent a version that appears in no passage. The
+        # sentries validator covers the first, the document checks the second,
+        # so they are MERGED rather than one overwriting the other.
+        doc_details = _document_validation(doc, query, answer, locals().get("contexts"))
+        if doc_details:
+            existing = eval_doc.get("validator_details") or {}
+            merged_checks = list(existing.get("checks") or []) + doc_details["checks"]
+            eval_doc["validator_details"] = {
+                **existing,
+                "checks":        merged_checks,
+                "document_mode": True,
+                "total_penalty": round(
+                    (existing.get("total_penalty") or 0.0) + doc_details["total_penalty"], 4),
+            }
 
     elif intent == "sentries":
         # Deterministic validator replaces RAGAS for sentries-only responses.

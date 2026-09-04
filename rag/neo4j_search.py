@@ -196,7 +196,18 @@ LIMIT $max_expand
 
 
 def log(msg: str, level: str = "INFO"):
-    print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] [{level}] {msg}", flush=True)
+    """Print a timestamped line, surviving consoles that cannot encode it.
+
+    See the matching guard in rag/rag_generator.py: a check mark in a start-up
+    message is enough to raise UnicodeEncodeError on a cp1252 console and take
+    retrieval down with it.
+    """
+    line = f"[{datetime.now():%Y-%m-%d %H:%M:%S}] [{level}] {msg}"
+    try:
+        print(line, flush=True)
+    except UnicodeEncodeError:
+        enc = (getattr(sys.stdout, "encoding", None) or "ascii")
+        print(line.encode(enc, "replace").decode(enc, "replace"), flush=True)
 
 
 # ── Reranker wrapper ─────────────────────────────────────────────────────────────

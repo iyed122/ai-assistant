@@ -108,6 +108,17 @@ else:
     import logging
     logging.getLogger("main").warning("training_pipeline_router not found — pipeline endpoints unavailable")
 
+# ── Mount RAFT evaluation router ──────────────────────────────────────────────
+# Post-training half of the loop: adapter -> Ollama, both arms, metrics, gate.
+# Imported defensively so a missing evaluator environment degrades to "endpoints
+# unavailable" rather than taking the whole API down.
+try:
+    from api.raft_eval_router import router as raft_router
+    app.include_router(raft_router)
+except Exception as _e:  # noqa: BLE001
+    import logging
+    logging.getLogger("main").warning("raft_eval_router unavailable: %s", _e)
+
 # ── Request / Response models ─────────────────────────────────────────────────
 class ChatRequest(BaseModel):
     query: str

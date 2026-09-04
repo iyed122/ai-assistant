@@ -46,6 +46,33 @@ logger = logging.getLogger("weaver")
 
 OLLAMA_HOST  = os.getenv("OLLAMA_HOST",  "http://localhost:11434").strip().rstrip("/")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3:8b").strip()
+
+# ── Runtime model switching ───────────────────────────────────────────────────
+# OLLAMA_MODEL is the boot default. A trained adapter is served by creating an
+# Ollama model that layers it onto the same base (FROM qwen3:8b + ADAPTER), so
+# switching to a fine-tune is a matter of pointing generation at that tag.
+#
+# Resolved per-request rather than at import so the active model can be changed
+# from the API without restarting the backend. Everything else -- prompts,
+# decoding parameters, context budgets -- is untouched, so a switch changes the
+# weights and nothing else, which is what makes before/after comparable.
+_active_model: str = OLLAMA_MODEL
+
+
+def get_active_model() -> str:
+    """Model tag generation currently uses."""
+    return _active_model
+
+
+def set_active_model(name: str) -> str:
+    """Point generation at a different Ollama model. Returns the new value."""
+    global _active_model
+    name = (name or "").strip()
+    if not name:
+        raise ValueError("model name must not be empty")
+    _active_model = name
+    logger.info("Weaver active model -> %s", _active_model)
+    return _active_model
 MAX_TOKENS   = int(os.getenv("WEAVER_MAX_TOKENS", "2010"))
 TEMPERATURE  = float(os.getenv("WEAVER_TEMPERATURE", "0.2"))
 
@@ -200,6 +227,118 @@ def _strip_think(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# RAFT scaffolding filter
+# ---------------------------------------------------------------------------
+# The RAFT adapter is trained to emit an internal reasoning chain of the form
+#     ##Reason: … ##begin_quote## verbatim span ##end_quote## …
+#     ##Answer: the human-readable answer
+# The scaffolding is what forces the model to ground its answer in a quoted
+# span from the retrieved context, and it is the mechanism the training curve
+# is chasing. It is not intended for the end user any more than <think> is:
+# the user gets the final answer, the citation logic stays under the hood.
+#
+# _strip_raft handles the non-streaming case, and _RaftFilter mirrors the
+# streaming shape of _ThinkFilter so the buffering rules stay consistent.
+
+_RAFT_ANSWER_RE = re.compile(r"##\s*Answer\s*[:\-]\s*", re.IGNORECASE)
+_RAFT_QUOTE_RE  = re.compile(
+    r"##\s*begin_quote\s*##(.*?)##\s*end_quote\s*##", re.IGNORECASE | re.DOTALL)
+_RAFT_REASON_RE = re.compile(r"##\s*Reason\s*[:\-]\s*", re.IGNORECASE)
+
+
+def _strip_raft(text: str) -> str:
+    """Return only the human-readable answer portion of a RAFT response.
+
+    If the model emitted a `##Answer:` marker, everything after it is the
+    presentable answer. If not, fall back to removing the scaffolding tokens
+    in place so the text degrades gracefully rather than showing nothing.
+    """
+    if not text:
+        return text
+    m = _RAFT_ANSWER_RE.search(text)
+    if m:
+        return text[m.end():].strip()
+    cleaned = _RAFT_QUOTE_RE.sub(lambda x: x.group(1).strip(), text)
+    cleaned = _RAFT_REASON_RE.sub("", cleaned)
+    return cleaned.strip()
+
+
+class _RaftFilter:
+    """Streaming counterpart to `_strip_raft`.
+
+    The hard requirement is that this must not break token-by-token streaming
+    for the ordinary case. An earlier version buffered every chunk until it saw
+    `##Answer:`; a base model never emits that marker, so the whole response
+    was withheld and delivered in one lump at the end. The user watched a
+    spinner instead of text appearing as it was generated.
+
+    So the decision is made from a short probe window instead. Only output that
+    actually looks RAFT-formatted is held back; everything else is passed
+    straight through, one chunk at a time, exactly as it arrives.
+    """
+
+    # Enough to see "##Reason:" or the start of "##begin_quote##".
+    _PROBE_CHARS = 48
+
+    def __init__(self) -> None:
+        self._buf: str = ""
+        self._decided: bool = False      # has the format question been settled?
+        self._engaged: bool = False      # is this RAFT-shaped output?
+        self._past_marker: bool = False
+
+    def _looks_raft(self, text: str) -> bool:
+        head = text.lstrip()
+        return bool(_RAFT_REASON_RE.match(head)
+                    or "##begin_quote" in text.lower()
+                    or _RAFT_ANSWER_RE.search(text))
+
+    def feed(self, chunk: str) -> str:
+        # Plain output, or already past the answer marker: stream untouched.
+        if self._decided and not self._engaged:
+            return chunk
+        if self._past_marker:
+            return chunk
+
+        self._buf += chunk
+
+        if not self._decided:
+            if self._looks_raft(self._buf):
+                self._decided = self._engaged = True
+            elif len(self._buf) >= self._PROBE_CHARS:
+                # Not RAFT output -- release the probe window and stop
+                # interfering, so streaming resumes immediately.
+                self._decided = True
+                self._engaged = False
+                out, self._buf = self._buf, ""
+                return out
+            else:
+                return ""   # still deciding; at most _PROBE_CHARS held
+
+        m = _RAFT_ANSWER_RE.search(self._buf)
+        if not m:
+            return ""
+        self._past_marker = True
+        tail = self._buf[m.end():]
+        self._buf = ""
+        return tail
+
+    def flush(self) -> str:
+        if self._past_marker or not self._buf:
+            self._buf = ""
+            return ""
+        residual = self._buf
+        self._buf = ""
+        if not self._engaged:
+            # Short plain answer that never filled the probe window.
+            return residual
+        # Engaged but no ##Answer: arrived -- degrade gracefully rather than
+        # swallowing the response.
+        residual = _RAFT_QUOTE_RE.sub(lambda x: x.group(1).strip(), residual)
+        residual = _RAFT_REASON_RE.sub("", residual)
+        return residual.strip()
+
+
+# ---------------------------------------------------------------------------
 # Ollama I/O (num_ctx now env-driven; otherwise unchanged)
 # ---------------------------------------------------------------------------
 
@@ -211,7 +350,7 @@ def _build_payload(prompt: str, stream: bool, intent: str = "both") -> dict:
     else:
         num_predict = 800
     return {
-        "model":   OLLAMA_MODEL,
+        "model":   _active_model,
         "prompt":  prompt,
         "stream":  stream,
         "think":   False,
@@ -233,7 +372,7 @@ def _ollama_generate(prompt: str, intent: str = "both") -> str:
         )
         resp.raise_for_status()
         raw = resp.json().get("response", "").strip()
-        return _strip_think(raw)
+        return _strip_raft(_strip_think(raw))
     except requests.exceptions.ConnectionError:
         return "ERROR: Ollama is not reachable. Please run `ollama serve`."
     except requests.exceptions.Timeout:
@@ -253,6 +392,7 @@ def _ollama_stream(prompt: str, intent: str = "both") -> Generator[str, None, No
         ) as resp:
             resp.raise_for_status()
             filt                   = _ThinkFilter()
+            raft                   = _RaftFilter()
             emitted_thinking_sig   = False
             erased_thinking_sig    = False
 
@@ -277,13 +417,23 @@ def _ollama_stream(prompt: str, intent: str = "both") -> Generator[str, None, No
                         erased_thinking_sig = True
                         yield "\x00DONE_THINKING"
 
+                    # RAFT scaffolding runs the same pattern as <think>: hold
+                    # the pre-answer reasoning back, release the answer as it
+                    # arrives.
                     if clean:
-                        yield clean
+                        emitted = raft.feed(clean)
+                        if emitted:
+                            yield emitted
 
                 if data.get("done"):
                     tail = filt.flush()
                     if tail:
+                        tail = raft.feed(tail)
+                    tail_raft = raft.flush()
+                    if tail:
                         yield tail
+                    if tail_raft:
+                        yield tail_raft
                     break
 
     except requests.exceptions.ConnectionError:

@@ -35,6 +35,7 @@ import hashlib
 import json
 import logging
 import os
+import random
 import re
 from datetime import datetime
 from pathlib import Path
@@ -806,3 +807,258 @@ if __name__ == "__main__":
         pprint.pprint(dataset_stats())
     else:
         parser.print_help()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RAFT export
+# ─────────────────────────────────────────────────────────────────────────────
+
+RAFT_GOLDEN_SHARE = float(os.getenv("RAFT_GOLDEN_SHARE", "0.75"))
+RAFT_DISTRACTORS  = int(os.getenv("RAFT_DISTRACTORS", "4"))
+RAFT_MAX_DUP_RATE = float(os.getenv("RAFT_MAX_DUP_RATE", "0.05"))
+
+_SENT_SPLIT = re.compile(r"(?<=[.!?])\s+")
+
+
+def _best_supporting_sentence(answer: str, passage: str) -> Optional[str]:
+    """Pick the passage sentence the answer leans on hardest.
+
+    RAFT's target must quote its evidence verbatim, so the span has to be a
+    real substring of the passage rather than a paraphrase. Selection is by
+    content-word overlap, and it fails closed: if no sentence shares enough
+    with the answer, the example is dropped rather than given an invented
+    quote.
+
+    The acceptance bar is deliberately modest. An earlier version scored
+    overlap / sqrt(len(sentence)) and required >= 1.0, which rejected every
+    candidate in the corpus and produced a set containing nothing but
+    abstentions -- the exact degenerate shape the promotion gate exists to
+    catch.
+    """
+    a_words = {w for w in re.findall(r"[a-z0-9]{4,}", (answer or "").lower())}
+    if len(a_words) < 3:
+        return None
+    best, best_ratio = None, 0.0
+    for sent in _SENT_SPLIT.split(passage or ""):
+        sent = sent.strip()
+        if not (30 <= len(sent) <= 320):
+            continue
+        s_words = {w for w in re.findall(r"[a-z0-9]{4,}", sent.lower())}
+        if len(s_words) < 3:
+            continue
+        shared = a_words & s_words
+        ratio = len(shared) / len(s_words)
+        if len(shared) >= 3 and ratio > best_ratio:
+            best, best_ratio = sent, ratio
+    return best if best_ratio >= 0.20 else None
+
+
+def _describe_passages(passages: List[str], limit: int = 3) -> str:
+    """Name what the context *does* hold, for a context-derived abstention."""
+    names = []
+    for p in passages[:limit]:
+        head = (p or "").strip().split("\n", 1)[0][:70].strip(" -—:")
+        if head:
+            names.append(head)
+    if not names:
+        return "the retrieved passages"
+    if len(names) == 1:
+        return f'"{names[0]}"'
+    return ", ".join(f'"{n}"' for n in names[:-1]) + f' and "{names[-1]}"'
+
+
+def _raft_abstention(question: str, passages: List[str]) -> str:
+    """Build an abstention that names the passages actually retrieved.
+
+    A single hard-coded refusal sentence repeated across the set is the exact
+    defect the promotion gate caught once before: twenty percent of a training
+    set was one identical target, and the adapter memorised the string instead
+    of learning the behaviour. Every abstention here is therefore derived from
+    its own context.
+    """
+    return (
+        "##Reason: The retrieved context covers "
+        f"{_describe_passages(passages)}, none of which states what the "
+        "question asks for, so there is no span to quote.\n"
+        "##Answer: The retrieved documentation does not contain that "
+        "information. What is available covers "
+        f"{_describe_passages(passages)}."
+    )
+
+
+def export_raft(
+    output_path: Optional[Path] = None,
+    limit:       Optional[int] = None,
+    golden_share: float = RAFT_GOLDEN_SHARE,
+    seed:        int = 13,
+) -> int:
+    """
+    Export a RAFT training set from Hammer-scored conversations.
+
+    This is the export that closes the loop for the objective this project
+    actually trains. Its inputs are the evaluator's own verdicts, so training
+    data is collected by using the assistant and scoring it -- no separate
+    labelling pass, and nothing leaves the machine.
+
+    Construction, following Zhang et al. (2024):
+
+      golden_share of examples   question + the answering passage among
+                                 RAFT_DISTRACTORS distractors; the target
+                                 reasons, quotes its evidence verbatim between
+                                 ##begin_quote## markers, then answers.
+
+      the remainder              the answering passage is withheld and only
+                                 distractors are shown; the target declines,
+                                 naming what the context does hold.
+
+    GOLD-graded documents supply the answerable examples: those are the cases
+    where the evaluator confirmed the answer was faithful to its context, so
+    the answer can be trusted as a target. Distractors are drawn from other
+    documents' passages, which is what teaches the model to discriminate the
+    answering passage from plausible neighbours.
+
+    Format per line:
+      {"question", "context", "target", "has_golden",
+       "metadata": {doc_hash, grade, intent, n_distractors}}
+
+    Returns: number of records exported.
+    """
+    output_path = Path(output_path or (OUTPUT_DIR / "raft_train.jsonl"))
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    db = _get_db()
+    cursor = db["chat_history"].find(
+        {
+            "$and": [
+                {"error": None},
+                {"answer": {"$exists": True, "$ne": ""}},
+                {"query": {"$exists": True, "$ne": ""}},
+                {"evaluation.quality_grade": "GOLD"},
+            ]
+        }
+    )
+    if limit:
+        cursor = cursor.limit(int(limit))
+    docs = list(cursor)
+    if not docs:
+        logger.warning("export_raft: no GOLD documents available; nothing to export")
+        return 0
+
+    # Passage pool for distractors, keyed by doc so a document never draws a
+    # distractor from itself.
+    per_doc: Dict[str, List[str]] = {}
+    for d in docs:
+        try:
+            per_doc[str(d.get("_id"))] = _retrieve_context(d.get("query", ""), doc=d)
+        except Exception as exc:                       # retrieval is best-effort
+            logger.debug("export_raft: context failed for %s: %s", d.get("_id"), exc)
+            per_doc[str(d.get("_id"))] = []
+
+    rng = random.Random(seed)
+    all_ids = [i for i, p in per_doc.items() if p]
+    skipped = {"no_context": 0, "no_distractors": 0, "no_verbatim_span": 0}
+
+    # Resolve span eligibility BEFORE deciding the golden/abstention split.
+    #
+    # An earlier version drew the coin first and skipped the example when no
+    # verbatim span could be found. Because only the golden branch needs a
+    # span, every such failure removed a golden example and left the
+    # abstentions untouched -- a set asked for 75% golden came out 27% golden.
+    # A set dominated by refusals teaches refusing, which is the failure mode
+    # this whole pipeline exists to avoid.
+    eligible, plain = [], []
+    for d in docs:
+        did = str(d.get("_id"))
+        passages = per_doc.get(did) or []
+        if not passages:
+            skipped["no_context"] += 1
+            continue
+        span = _best_supporting_sentence(d.get("answer", ""), passages[0])
+        (eligible if span else plain).append((d, passages, span))
+        if not span:
+            skipped["no_verbatim_span"] += 1
+
+    # The number of abstentions follows from the golden count, so the ratio
+    # holds whatever the corpus yields.
+    n_golden = len(eligible)
+    n_abstain = int(round(n_golden * (1.0 - golden_share) / golden_share)) if golden_share else 0
+    abstain_pool = plain + eligible          # any document can host an abstention
+    rng.shuffle(abstain_pool)
+    abstain_set = abstain_pool[:n_abstain]
+
+    written, targets = 0, []
+    with output_path.open("w", encoding="utf-8") as fh:
+        def _distractors_for(did):
+            pool = []
+            for other in rng.sample(all_ids, min(len(all_ids), 8)):
+                if other == did:
+                    continue
+                pool.extend(per_doc[other])
+            rng.shuffle(pool)
+            return pool[:RAFT_DISTRACTORS]
+
+        def _emit(d, blocks, target, has_golden, n_dist):
+            nonlocal written
+            targets.append(target)
+            fh.write(json.dumps({
+                "question":   d.get("query", "").strip(),
+                "context":    _build_rag_context(blocks),
+                "target":     target,
+                "has_golden": has_golden,
+                "metadata": {
+                    "doc_hash":      _doc_hash(d.get("_id")),
+                    "grade":         (d.get("evaluation") or {}).get("quality_grade"),
+                    "intent":        d.get("intent"),
+                    "n_distractors": n_dist,
+                },
+            }, ensure_ascii=False) + "\n")
+            written += 1
+
+        for d, passages, span in eligible:
+            did = str(d.get("_id"))
+            distractors = _distractors_for(did)
+            if not distractors:
+                skipped["no_distractors"] += 1
+                continue
+            blocks = distractors + [passages[0]]
+            rng.shuffle(blocks)
+            _emit(d, blocks,
+                  f"##Reason: The answering passage states "
+                  f"##begin_quote##{span}##end_quote## which settles the "
+                  f"question.\n##Answer: {d.get('answer', '').strip()}",
+                  True, len(distractors))
+
+        for d, passages, _span in abstain_set:
+            did = str(d.get("_id"))
+            distractors = _distractors_for(did)
+            if not distractors:
+                skipped["no_distractors"] += 1
+                continue
+            _emit(d, distractors,
+                  _raft_abstention(d.get("query", "").strip(), distractors),
+                  False, len(distractors))
+
+    # Duplicate-target guard. A set dominated by one repeated string trains
+    # memorisation, not behaviour -- this is checked here rather than
+    # discovered later by the promotion gate.
+    if written:
+        dup_rate = 1.0 - (len(set(targets)) / len(targets))
+        if dup_rate > RAFT_MAX_DUP_RATE:
+            logger.warning(
+                "export_raft: %.1f%% of targets are duplicates (limit %.1f%%) -- "
+                "the set is at risk of teaching a fixed string",
+                dup_rate * 100, RAFT_MAX_DUP_RATE * 100)
+        else:
+            logger.info("export_raft: duplicate targets %.1f%% (within limit)",
+                     dup_rate * 100)
+
+    golden_n = sum(1 for t in targets if "##begin_quote##" in t)
+    logger.info("export_raft: wrote %d examples (%d with golden, %d abstention) -> %s",
+                written, golden_n, written - golden_n, output_path)
+    if any(skipped.values()):
+        logger.info("export_raft: skipped %s", dict(skipped))
+    if written and golden_n == 0:
+        logger.error("export_raft: NO golden examples were produced -- a set of "
+                     "pure abstentions teaches a fixed refusal, not grounding. "
+                     "Check _best_supporting_sentence against this corpus.")
+    return written

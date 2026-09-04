@@ -615,6 +615,377 @@ def validate_sentry_answer(
     return score, details
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# Document-grounded validation  (v1.2)
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Why this exists
+# ───────────────
+# Every check above was written against ticket traffic: it looks for fabricated
+# Jira keys, bad prefixes, round-number statistics. On the rag intent the
+# evaluator scores faithfulness with RAGAS and never calls the validator at all,
+# so on documentation answers NO check can fire — measured over 299 judged
+# documentation answers, zero failure tags were raised while 22 of them cited a
+# version or config key that appears nowhere in their retrieved context.
+#
+# That is a blind spot in the taxonomy, not in the model: the detectors simply
+# did not cover the way a documentation answer goes wrong. These checks close it.
+#
+# They are deterministic string containment against the retrieved context — no
+# LLM, no quota, and unaffected by a model that games the score by refusing
+# (a refusal cites nothing, so it can neither pass nor fail these).
+#
+# Calibration intent: fire on what an engineer would call wrong, stay silent on
+# style. Every check exempts identifiers echoed from the user's own query, and
+# skips entirely when there is no context to verify against — an unverifiable
+# answer is not evidence of fabrication.
+
+# A version-like token: 4.22.5, 2.13, 5.15.2.1
+_VERSION_RE = re.compile(r"\b\d+\.\d+(?:\.\d+){0,2}\b")
+
+# A hyphenated config key / component id: ingress-nginx, pilot-manager-foundations
+_CONFIG_KEY_RE = re.compile(r"\b[a-z][a-z0-9]*(?:-[a-z0-9]+){2,}\b")
+
+# A filename with a technical extension
+_FILENAME_RE = re.compile(
+    r"\b[\w\-]+\.(?:xml|json|conf|cfg|ya?ml|sh|py|log|ini|tgz|dat|txt|lz4|toml|env)\b")
+
+# A sized quantity — the figure an engineer would provision against.
+_QUANTITY_RE = re.compile(
+    r"\b\d+(?:\.\d+)?\s?(?:GB|TB|MB|KB|Gbps|Mbps|Kbps|ms|GHz|MHz|vCPU|cores?|%)\b", re.I)
+
+# Prose that happens to be hyphenated — never a config key.
+_HYPHEN_PROSE = {
+    "state-of-the-art", "up-to-date", "out-of-the-box", "end-to-end",
+    "read-only", "write-only", "high-availability", "step-by-step",
+    "day-to-day", "long-term", "short-term", "well-known", "third-party",
+    "real-time", "built-in", "trade-off", "follow-up", "on-premise",
+}
+
+# The model breaking character instead of following the prompt: it was told to
+# answer from the supplied context, so announcing that it has no API access or
+# cannot browse is an instruction violation, not a limitation.
+_PERSONA_BREAK_RE = re.compile(
+    r"\b(as an? (?:AI|language model|assistant)"
+    r"|I (?:do not|don't) have (?:access|the ability)"
+    r"|I (?:cannot|can't) (?:browse|access the internet|call the API)"
+    r"|my training data|my knowledge cutoff)\b", re.I)
+
+# Markers that the answer is substantive rather than an abstention.
+_ABSTAIN_RE = re.compile(
+    r"does not (contain|mention|support|provide|include|specify|cover)"
+    r"|no (relevant |specific |such )?(information|details?|documentation)"
+    r"|cannot be (answered|determined|verified)"
+    r"|is not (available|present|found) in the", re.I)
+
+
+def _norm(text: str) -> str:
+    """Whitespace- and case-normalised, for containment tests."""
+    return re.sub(r"\s+", " ", (text or "")).lower()
+
+
+def _loose(text: str) -> str:
+    """
+    Normalised to alphanumerics and single spaces.
+
+    Exact containment produced false fabrications: `release-notes-1` appears in
+    the context as part of a URL slug, and titles are re-punctuated when quoted
+    ("Release note - NEA Composer 2.8.0," with a trailing comma). Matching on a
+    punctuation-free form keeps the check about whether the FACT is supported
+    rather than whether the formatting matches.
+    """
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9 ]", " ", _norm(text))).strip()
+
+
+def _unsupported(cited: set, haystack: str, query: str) -> list:
+    """
+    Cited tokens absent from the evidence.
+
+    Query-echoed tokens are never fabrications — a model asked about version
+    4.22.5 is expected to say 4.22.5, whether or not retrieval returned it.
+    Both sides are compared loosely, so `4.22.5` still matches `4.22.5.` and
+    `ingress-nginx` matches `ingress_nginx`.
+    """
+    hay, q = _loose(haystack), _loose(query)
+    out = []
+    for t in cited:
+        lt = _loose(t)
+        if lt and lt not in hay and lt not in q:
+            out.append(t)
+    return sorted(out)
+
+
+def _title_supported(title: str, corpus: str) -> bool:
+    """
+    A quoted title counts as supported when nearly all of its significant words
+    appear in the evidence.
+
+    Documentation titles get reworded when cited — word order changes, suffixes
+    are dropped, punctuation moves. Demanding an exact substring flagged 1 in 6
+    answers as fabricating a title, which is not credible. Requiring 80% of the
+    content words keeps genuine invention detectable while tolerating rephrasing.
+    """
+    words = [w for w in _loose(title).split() if len(w) > 2]
+    if len(words) < 3:
+        return True                       # too short to judge; do not accuse
+    hay = _loose(corpus)
+    hits = sum(1 for w in words if w in hay)
+    return hits / len(words) >= 0.80
+
+
+def _check_doc_version_fabrication(answer: str, ctx: str, query: str) -> Tuple[float, str]:
+    """A version number that appears nowhere in the retrieved context.
+
+    This is the single most common documentation failure: the model answers
+    about 4.22.5 when the passage only ever discusses 4.20.3. It reads as
+    authoritative and is wrong in the one detail an engineer would act on.
+    """
+    if not ctx:
+        return 0.0, "no_context_to_verify"
+    cited = set(_VERSION_RE.findall(answer))
+    if not cited:
+        return 0.0, "no_versions_cited"
+    bad = _unsupported(cited, ctx, query)
+    if not bad:
+        return 0.0, "all_versions_supported"
+    # Scale with how much of the answer's version usage is unsupported, so one
+    # stray token in a long correct answer is not treated like wholesale invention.
+    share = len(bad) / len(cited)
+    penalty = 0.15 if share <= 0.34 else 0.25
+    return penalty, f"unsupported_versions: {bad[:3]}"
+
+
+def _check_doc_identifier_fabrication(answer: str, ctx: str, query: str) -> Tuple[float, str]:
+    """Config keys and filenames cited but absent from the retrieved context."""
+    if not ctx:
+        return 0.0, "no_context_to_verify"
+    cited = {t for t in _CONFIG_KEY_RE.findall(answer) if t not in _HYPHEN_PROSE}
+    cited |= set(_FILENAME_RE.findall(answer))
+    if not cited:
+        return 0.0, "no_identifiers_cited"
+    bad = _unsupported(cited, ctx, query)
+    if not bad:
+        return 0.0, "all_identifiers_supported"
+    return (0.10 if len(bad) == 1 else 0.20), f"unsupported_identifiers: {bad[:3]}"
+
+
+def _check_doc_jira_fabrication(answer: str, ctx: str, sources: List[Dict],
+                                query: str) -> Tuple[float, str]:
+    """
+    A Jira key cited in a documentation answer that appears neither in the
+    context, nor in the sources, nor in the question.
+
+    Works with or without the live API: the evidence is whatever was actually
+    put in front of the model.
+    """
+    # Require at least two digits: single-digit matches (OTT-1, TLCN-1) are
+    # almost always product names or list markers caught by the key regex, not
+    # ticket references, and accusing them of fabrication is a false positive.
+    cited = {k for k in _JIRA_KEY_RE.findall(answer.upper())
+             if len(k.split("-")[-1]) >= 2}
+    if not cited:
+        return 0.0, "no_jira_keys_cited"
+    corpus = _norm(ctx) + " " + _norm(" ".join(
+        (s.get("title") or "") + " " + (s.get("url") or "") + " " + str(s.get("key") or "")
+        for s in (sources or [])))
+    if not corpus.strip():
+        return 0.0, "no_evidence_to_verify"
+    bad = _unsupported(cited, corpus, query)
+    if not bad:
+        return 0.0, "all_keys_supported"
+    return 0.25, f"fabricated_jira_keys: {bad[:3]}"
+
+
+def _check_confluence_title_fabrication(answer: str, ctx: str, sources: List[Dict],
+                                        query: str) -> Tuple[float, str]:
+    """
+    A quoted document title the evidence never mentions.
+
+    Only quoted/bolded spans are considered, and only those that look like a
+    document title (contain a version, or a known product word) — otherwise the
+    model's own section headings would be read as citations.
+    """
+    corpus = _norm(ctx) + " " + _norm(" ".join((s.get("title") or "") for s in (sources or [])))
+    if not corpus.strip():
+        return 0.0, "no_evidence_to_verify"
+    spans = re.findall(r'"([^"]{8,90})"', answer) + re.findall(r'\*\*([^*]{8,90})\*\*', answer)
+    # A document title, not any emphasised sentence. Matching the bare word
+    # "installation" treated bolded prose ("Installation from ISO is mandatory")
+    # as a citation. A title carries a product name or a document-type phrase,
+    # and does not read as a clause — so spans containing a finite verb are
+    # excluded.
+    _TITLE_HINT = re.compile(
+        r"\b(release note|upgrade procedure|installation procedure|user guide"
+        r"|test report|NEA[- ]?(?:DVR|CDN|Live|Composer)|TITAN|PILOT)\b", re.I)
+    _CLAUSE = re.compile(r"\b(is|are|was|were|must|should|can|will|has|have|does)\b", re.I)
+    titleish = [s for s in spans
+                if (_VERSION_RE.search(s) or _TITLE_HINT.search(s)) and not _CLAUSE.search(s)]
+    if not titleish:
+        return 0.0, "no_document_titles_cited"
+    bad = [s for s in titleish
+           if not _title_supported(s, corpus) and not _title_supported(s, query)]
+    if not bad:
+        return 0.0, "all_titles_supported"
+    return 0.20, f"unsupported_document_titles: {[b[:60] for b in bad[:2]]}"
+
+
+def _check_gitlab_ref_fabrication(answer: str, ctx: str, sources: List[Dict],
+                                  query: str) -> Tuple[float, str]:
+    """A GitLab MR/issue reference (!123, #456) with no support in the evidence."""
+    cited = set(_GITLAB_REF_RE.findall(answer))
+    if not cited:
+        return 0.0, "no_gitlab_refs_cited"
+    corpus = _norm(ctx) + " " + _norm(" ".join(
+        (s.get("title") or "") + " " + (s.get("url") or "") for s in (sources or [])))
+    if not corpus.strip():
+        return 0.0, "no_evidence_to_verify"
+    q = _norm(query)
+    bad = sorted(r for r in cited if r not in corpus and r not in q)
+    if not bad:
+        return 0.0, "all_refs_supported"
+    return 0.15, f"unsupported_gitlab_refs: {bad[:3]}"
+
+
+def _check_quantity_fabrication(answer: str, ctx: str, query: str) -> Tuple[float, str]:
+    """
+    A capacity, size or throughput figure the context never states.
+
+    This is the failure with real operational cost: "supports up to 40 Gbps" or
+    "requires 16 GB" is the line an engineer sizes hardware from. Wrong here is
+    worse than vague, so it is treated as fabrication rather than style.
+    """
+    if not ctx:
+        return 0.0, "no_context_to_verify"
+    cited = set(_QUANTITY_RE.findall(answer))
+    if not cited:
+        return 0.0, "no_quantities_cited"
+    bad = _unsupported(cited, ctx, query)
+    if not bad:
+        return 0.0, "all_quantities_supported"
+    return (0.10 if len(bad) == 1 else 0.20), f"unsupported_quantities: {bad[:3]}"
+
+
+def _check_url_fabrication(answer: str, ctx: str, sources: List[Dict],
+                           query: str) -> Tuple[float, str]:
+    """
+    A link that leads somewhere the evidence never referenced.
+
+    Only the path is compared, not the query string, so tracking parameters do
+    not create false fabrications. A confidently-cited dead link is the kind of
+    thing a reader trusts without checking.
+    """
+    urls = _URL_RE.findall(answer)
+    if not urls:
+        return 0.0, "no_urls_cited"
+    corpus = _norm(ctx) + " " + _norm(" ".join((s.get("url") or "") for s in (sources or [])))
+    if not corpus.strip():
+        return 0.0, "no_evidence_to_verify"
+    bad = []
+    for u in urls:
+        path = _loose(re.sub(r"[?#].*$", "", u if isinstance(u, str) else str(u)))
+        if path and path not in _loose(corpus) and path not in _loose(query):
+            bad.append(u if isinstance(u, str) else str(u))
+    if not bad:
+        return 0.0, "all_urls_supported"
+    return 0.15, f"unsupported_urls: {[b[:60] for b in bad[:2]]}"
+
+
+def _check_uncited_answer(answer: str, ctx: str) -> Tuple[float, str]:
+    """
+    A substantive answer that cites nothing.
+
+    The system prompt instructs the model to cite the pages or keys it relied
+    on. A long confident answer with no citation cannot be checked by a reader,
+    which is the standard an engineer would hold it to. Abstentions are exempt —
+    there is nothing to cite when declining.
+    """
+    if len(answer) < 220 or _ABSTAIN_RE.search(answer):
+        return 0.0, "not_applicable"
+    has_citation = bool(
+        re.search(r'"[^"]{8,90}"|\*\*[^*]{8,90}\*\*|`[^`]{3,60}`', answer)
+        or _JIRA_KEY_RE.search(answer.upper())
+        or _URL_RE.search(answer)
+        or _VERSION_RE.search(answer))
+    if has_citation:
+        return 0.0, "citation_present"
+    return 0.10, "substantive_answer_without_citation"
+
+
+def _check_instruction_violation(answer: str, ctx: str) -> Tuple[float, str]:
+    """
+    The model breaks character instead of using the supplied context.
+
+    Only fires when context WAS provided — without evidence, saying so is
+    correct behaviour rather than a violation.
+    """
+    if not ctx:
+        return 0.0, "no_context_supplied"
+    m = _PERSONA_BREAK_RE.search(answer)
+    if not m:
+        return 0.0, "ok"
+    return 0.15, f"instruction_violation: {m.group(0)[:40]}"
+
+
+def validate_document_answer(
+    answer: str,
+    context: str = "",
+    sources: Optional[List[Dict]] = None,
+    query: str = "",
+) -> Tuple[float, Dict[str, Any]]:
+    """
+    Deterministic validation for document-grounded (rag / both) answers.
+
+    Complements RAGAS rather than replacing it: RAGAS judges whether claims are
+    entailed by the passages, this catches the specific, checkable ways a
+    documentation answer goes wrong — an invented version, a config key that
+    exists nowhere, a cited page that was never retrieved, an uncited wall of
+    text, or the model ignoring its instructions.
+
+    Returns (score, details) in the same shape as validate_sentry_answer, so the
+    existing failure-tag derivation consumes it unchanged.
+    """
+    if not answer:
+        return 0.10, {"error": "empty_answer", "checks": []}
+
+    sources = sources or []
+    ctx = _norm(context)
+
+    checks: List[Tuple[str, float, str]] = []
+
+    def run(name: str, fn, *args):
+        penalty, note = fn(*args)
+        checks.append((name, penalty, note))
+        return penalty
+
+    total = 0.0
+    total += run("doc_version_fabrication",      _check_doc_version_fabrication, answer, ctx, query)
+    total += run("doc_identifier_fabrication",   _check_doc_identifier_fabrication, answer, ctx, query)
+    total += run("doc_jira_fabrication",         _check_doc_jira_fabrication, answer, ctx, sources, query)
+    total += run("confluence_title_fabrication", _check_confluence_title_fabrication, answer, ctx, sources, query)
+    total += run("gitlab_ref_fabrication",       _check_gitlab_ref_fabrication, answer, ctx, sources, query)
+    total += run("quantity_fabrication",         _check_quantity_fabrication, answer, ctx, query)
+    total += run("url_fabrication",              _check_url_fabrication, answer, ctx, sources, query)
+    total += run("uncited_answer",               _check_uncited_answer, answer, ctx)
+    total += run("instruction_violation",        _check_instruction_violation, answer, ctx)
+
+    # Base mirrors validate_sentry_answer: 0.85 when the answer contains
+    # something checkable, 0.75 when it does not and therefore cannot be
+    # verified either way.
+    verifiable = bool(_VERSION_RE.search(answer) or _JIRA_KEY_RE.search(answer.upper())
+                      or _FILENAME_RE.search(answer) or _URL_RE.search(answer))
+    base = 0.85 if verifiable else 0.75
+
+    score = round(max(0.0, min(1.0, base - total)), 4)
+    details = {
+        "score":         score,
+        "base":          base,
+        "total_penalty": round(total, 4),
+        "mode":          "document",
+        "checks":        [{"name": n, "penalty": p, "note": note} for n, p, note in checks],
+    }
+    return score, details
+
+
 # ─── CLI smoke test ────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":

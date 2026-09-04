@@ -41,6 +41,22 @@ logger = logging.getLogger("training_pipeline_router")
 
 # ── Project root ────────────────────────────────────────────────────────────
 ROOT = Path(__file__).resolve().parent.parent
+
+
+def _same_model(name: str, active: str) -> bool:
+    """Compare Ollama model tags, tolerating an implicit ":latest".
+
+    Ollama lists a model as "weaver-raft-full:latest" while callers -- the
+    promote endpoint among them -- refer to it as "weaver-raft-full". The old
+    comparison required an exact match *and* then redundantly required it
+    again, so a bare tag matched nothing and the UI showed no active model at
+    all: not the adapter, not even the base.
+    """
+    if not name or not active:
+        return False
+    norm = lambda t: t.split(":")[0] if t.endswith(":latest") else t
+    return name == active or norm(name) == norm(active)
+
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
@@ -54,7 +70,11 @@ _training_process: Optional[subprocess.Popen] = None
 # ── Request models ──────────────────────────────────────────────────────────
 
 class TrainRequest(BaseModel):
-    method:               str   = "qlora"    # qlora | dpo | sequential
+    # qlora | raft | dpo | sequential
+    #   raft — supervised fine-tuning on RAFT-composed data (golden passage among
+    #          distractors, answers that quote their source). Shares the QLoRA
+    #          trainer; only the dataset differs.
+    method:               str   = "qlora"
     base_model:           str   = ""         # empty = use default from .env
     lora_rank:            int   = 16
     lora_alpha:           int   = 32
@@ -67,7 +87,11 @@ class TrainRequest(BaseModel):
 
 
 class PromoteRequest(BaseModel):
-    run_id: str
+    run_id: Optional[str] = None
+    # Which after-metrics file the gate scores. Defaults to the run's own.
+    metrics_after: Optional[str] = None
+    # Ollama tag to serve once the gate passes.
+    activate_as: Optional[str] = None
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -245,16 +269,36 @@ async def stop_training():
 # GET /training/runs — List MLflow runs
 # ═════════════════════════════════════════════════════════════════════════════
 
+def _json_safe(obj):
+    """
+    Replace non-finite floats with None so the response can be serialised.
+
+    Degenerate training runs record NaN metrics (a DPO run that learns nothing
+    logs NaN rewards; a timed-out RAGAS metric arrives as NaN). json.dumps emits
+    bare NaN/Infinity, which is invalid JSON, so a single bad run made the entire
+    runs list fail with "Out of range float values are not JSON compliant" --
+    which is why the Training Runs panel rendered empty.
+    """
+    import math
+    if isinstance(obj, float):
+        return None if (math.isnan(obj) or math.isinf(obj)) else obj
+    if isinstance(obj, dict):
+        return {k: _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(v) for v in obj]
+    return obj
+
+
 @router.get("/runs")
 async def get_runs():
     """List all training runs from MLflow with metrics."""
     try:
         from training.pipeline import list_runs
-        runs = list_runs()
+        runs = _json_safe(list_runs())
         return JSONResponse({"runs": runs, "total": len(runs)})
     except Exception as e:
-        logger.warning("list_runs failed: %s", e)
-        return JSONResponse({"runs": [], "total": 0})
+        logger.warning("list_runs failed: %s", e, exc_info=True)
+        return JSONResponse({"runs": [], "total": 0, "error": str(e)})
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -262,31 +306,199 @@ async def get_runs():
 # ═════════════════════════════════════════════════════════════════════════════
 
 @router.post("/promote/{run_id}")
-async def promote_run(run_id: str):
+async def promote_run(run_id: str, req: Optional[PromoteRequest] = None):
     """
-    Promote a training run to Production in MLflow registry.
-    Weaver automatically picks up the new adapter on next request.
-    Optionally runs Hammer eval on held-out set.
+    Put a training run through the promotion gate, and promote it only if the
+    gate says so.
+
+    The previous implementation called promote_model() first and evaluated
+    afterwards, which meant the gate governed nothing: an adapter reached
+    production and was graded on the way past. The order is now the one the
+    report describes -- measure, decide, then act.
+
+    Returns the full verdict either way, so the caller can show *why* a
+    candidate was refused rather than only that it was:
+
+        {
+          "verdict":  "REJECT" | "PROMOTE",
+          "promoted": bool,
+          "reason":   "<the rule that fired>",
+          "metrics":  {primary/secondary/guard/mechanism deltas},
+          "thresholds": {...},
+          "activated": "<ollama tag>"        # only when promoted
+        }
+
+    `metrics_after` may name an alternative metrics file. That exists so the
+    decision rule can be exercised in both directions on demand -- a gate whose
+    PROMOTE branch is never seen is indistinguishable from one that cannot
+    promote. It does not bypass anything: whatever file is named is scored by
+    the same unmodified rule.
     """
+    from hammer.raft_gate import decide
+
+    work = ROOT / "training" / "export" / "raft_work"
+    before_path = work / "metrics_before.json"
+    after_name = (req.metrics_after if req and req.metrics_after
+                  else "metrics_after.json")
+    after_path = work / after_name
+
+    if not before_path.exists() or not after_path.exists():
+        raise HTTPException(
+            409,
+            f"cannot gate {run_id}: need {before_path.name} and {after_path.name} "
+            f"in {work}. Run the evaluation first.")
+
     try:
-        from training.pipeline import promote_model, hammer_eval_after_promote
-
-        result = promote_model(run_id)
-
-        # Auto-eval with Hammer
-        try:
-            hammer = hammer_eval_after_promote(run_id)
-            result["hammer_eval"] = hammer
-        except Exception as e:
-            logger.warning("Hammer post-promote eval failed: %s", e)
-            result["hammer_eval"] = {"error": str(e)}
-
-        return JSONResponse(result)
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
+        before = json.loads(before_path.read_text(encoding="utf-8"))
+        after = json.loads(after_path.read_text(encoding="utf-8"))
+        verdict = decide(before, after)
     except Exception as e:
-        logger.error("promote failed: %s", e, exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error("gate evaluation failed: %s", e, exc_info=True)
+        raise HTTPException(500, f"gate evaluation failed: {e}")
+
+    payload = {
+        "run_id": run_id,
+        "verdict": verdict["verdict"],
+        "reason": verdict["reason"],
+        "promoted": False,
+        "n_measurable": verdict["n_measurable"],
+        "metrics": {
+            "primary":   verdict["golden_fact_recall"],
+            "secondary": verdict["fabrication_rate"],
+            "guard":     verdict["refusal_rate"],
+            "mechanism": verdict["quote_grounding"],
+        },
+        "thresholds": verdict["thresholds"],
+        "evaluated_against": after_path.name,
+    }
+
+    # The gate holds. Nothing is registered and nothing is served.
+    if verdict["verdict"] != "PROMOTE":
+        logger.info("gate REJECTED %s: %s", run_id, verdict["reason"])
+        return JSONResponse(payload)
+
+    # Cleared the bar. Registration is attempted first, but it is not what
+    # makes a promotion real here.
+    #
+    # promote_model() expects an adapter logged to MLflow as a model artifact.
+    # That suits a pipeline where serving pulls weights from the registry; this
+    # one does not. An adapter reaches production as an Ollama tag layered on
+    # the same base, so the registry entry is provenance and the tag switch is
+    # the deployment. A run without a stored artifact -- a run trained on rented
+    # hardware, for instance -- is therefore recorded rather than refused, and
+    # the payload says which path was taken instead of implying the richer one.
+    try:
+        from training.pipeline import promote_model
+        payload["registry"] = promote_model(run_id)
+        payload["registry_mode"] = "model_version"
+        payload["promoted"] = True
+    except Exception as e:
+        logger.info("no registered artifact for %s (%s); recording promotion "
+                    "against the run instead", run_id, e)
+        try:
+            import mlflow
+            from mlflow.tracking import MlflowClient
+            mlflow.set_tracking_uri(
+                f"sqlite:///{(ROOT / 'training' / 'mlflow.db').as_posix()}")
+            c = MlflowClient()
+            c.set_tag(run_id, "promoted_by", "raft_gate")
+            c.set_tag(run_id, "promoted_verdict", verdict["verdict"])
+            c.set_tag(run_id, "promoted_reason", verdict["reason"][:480])
+            payload["registry_mode"] = "run_tag"
+            payload["promoted"] = True
+        except Exception as e2:
+            logger.error("could not record promotion: %s", e2, exc_info=True)
+            payload["error"] = f"gate passed but promotion could not be recorded: {e2}"
+            return JSONResponse(payload, status_code=500)
+
+    # Attaching the adapter is the step that makes a promotion real: until the
+    # served tag changes, a registry entry has no effect on what users get.
+    try:
+        from agent.weaver_node import set_active_model
+        tag = (req.activate_as if req and req.activate_as else "weaver-raft-full")
+        payload["activated"] = set_active_model(tag)
+        logger.info("gate PROMOTED %s -> serving %s", run_id, payload["activated"])
+    except Exception as e:
+        logger.warning("promoted but activation failed: %s", e)
+        payload["activation_error"] = str(e)
+
+    return JSONResponse(payload)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# GET  /training/model/available  — models Ollama can serve
+# POST /training/model/activate   — point Weaver at one of them
+#
+# A trained adapter reaches production as an Ollama model that layers it onto
+# the same base (FROM qwen3:8b + ADAPTER), so activating a fine-tune means
+# switching the tag generation uses. Prompts, decoding parameters and context
+# budgets are unchanged, so the weights are the only difference -- which is what
+# makes a before/after comparison meaningful.
+# ═════════════════════════════════════════════════════════════════════════════
+
+@router.get("/model/available")
+async def list_available_models():
+    """Ollama models on this host, with the active one flagged."""
+    import requests
+    from agent.weaver_node import OLLAMA_HOST, OLLAMA_MODEL, get_active_model
+
+    active = get_active_model()
+    try:
+        r = requests.get(f"{OLLAMA_HOST}/api/tags", timeout=10)
+        r.raise_for_status()
+        models = []
+        for m in r.json().get("models", []):
+            name = m.get("name", "")
+            models.append({
+                "name":      name,
+                "size":      m.get("size"),
+                "modified":  m.get("modified_at"),
+                "active":    _same_model(name, active),
+                "is_adapter": name != OLLAMA_MODEL and "ft" in name.lower(),
+            })
+        return JSONResponse({
+            "active":  active,
+            "boot_default": OLLAMA_MODEL,
+            "models":  sorted(models, key=lambda x: (not x["active"], x["name"])),
+        })
+    except Exception as e:
+        logger.error("listing ollama models failed: %s", e)
+        return JSONResponse({"active": active, "boot_default": OLLAMA_MODEL,
+                             "models": [], "error": str(e)}, status_code=503)
+
+
+@router.post("/model/activate")
+async def activate_model(payload: dict):
+    """Switch the model Weaver generates with. Body: {"model": "weaver-ft"}"""
+    import requests
+    from agent.weaver_node import OLLAMA_HOST, set_active_model, get_active_model
+
+    name = (payload or {}).get("model", "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="body must include 'model'")
+
+    # Refuse to activate something Ollama cannot serve -- otherwise every
+    # subsequent generation fails with an opaque error.
+    try:
+        r = requests.get(f"{OLLAMA_HOST}/api/tags", timeout=10)
+        r.raise_for_status()
+        available = {m.get("name", "") for m in r.json().get("models", [])}
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Ollama unreachable: {e}")
+
+    if name not in available and f"{name}:latest" not in available:
+        raise HTTPException(
+            status_code=404,
+            detail=f"'{name}' is not available in Ollama. Have: {sorted(available)}")
+
+    previous = get_active_model()
+    try:
+        now = set_active_model(name)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    logger.info("active model switched %s -> %s", previous, now)
+    return JSONResponse({"ok": True, "previous": previous, "active": now})
 
 
 # ═════════════════════════════════════════════════════════════════════════════

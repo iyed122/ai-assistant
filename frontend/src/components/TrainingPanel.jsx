@@ -105,7 +105,7 @@ function LossCurve({ logs }) {
 
 function PipelineTab() {
   const [config, setConfig] = useState({
-    method: 'qlora',
+    method: 'raft',
     lora_rank: 16,
     lora_alpha: 32,
     learning_rate: 0.0002,
@@ -260,7 +260,7 @@ function PipelineTab() {
         display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(140px, 1fr))',
         gap: 10, marginBottom: 16,
       }}>
-        <Field label="Method" field="method" options={['qlora', 'dpo', 'sequential']} />
+        <Field label="Method" field="method" options={['raft']} />
         <Field label="LoRA Rank" field="lora_rank" />
         <Field label="LoRA Alpha" field="lora_alpha" />
         <Field label="Learning Rate" field="learning_rate" step={0.00001} />
@@ -268,7 +268,6 @@ function PipelineTab() {
         <Field label="Batch Size" field="batch_size" />
         <Field label="Grad Accumulation" field="gradient_accumulation" />
         <Field label="Max Seq Length" field="max_seq_length" />
-        {config.method === 'dpo' && <Field label="DPO Beta" field="dpo_beta" step={0.01} />}
       </div>
 
       {config.base_model && (
@@ -375,14 +374,18 @@ function PipelineTab() {
 // Runs Tab (MLflow history + promote)
 // ═════════════════════════════════════════════════════════════════════════════
 
-function RunsTab() {
+function RunsTab({ view = 'runs' }) {
   const [runs, setRuns]               = useState([])
+  const [verdict, setVerdict]         = useState(null)
   const [currentModel, setCurrentModel] = useState(null)
   const [promoting, setPromoting]     = useState(null)
+  const [serving, setServing]         = useState(null)
+  const [activating, setActivating]   = useState(null)
 
   useEffect(() => {
     loadRuns()
     loadCurrentModel()
+    loadServingModels()
   }, [])
 
   const loadRuns = async () => {
@@ -400,14 +403,59 @@ function RunsTab() {
     } catch {}
   }
 
-  const handlePromote = async (runId) => {
-    setPromoting(runId)
+  // Serving model — a trained adapter reaches production as an Ollama model
+  // layering it onto the same base (FROM qwen3:8b + ADAPTER), so activating a
+  // fine-tune only changes which tag Weaver generates with. Prompts and decoding
+  // parameters stay identical, which is what keeps before/after comparable.
+  const loadServingModels = async () => {
     try {
-      await fetch(`${API}/training/promote/${runId}`, { method: 'POST' })
-      await loadRuns()
-      await loadCurrentModel()
+      const res = await fetch(`${API}/training/model/available`)
+      const data = await res.json()
+      setServing(data)
+    } catch {}
+  }
+
+  const handleActivate = async (name) => {
+    setActivating(name)
+    try {
+      const res = await fetch(`${API}/training/model/activate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: name }),
+      })
+      if (!res.ok) throw new Error((await res.json()).detail || res.statusText)
+      await loadServingModels()
     } catch (e) {
-      alert(`Promote failed: ${e.message}`)
+      alert(`Activation failed: ${e.message}`)
+    } finally {
+      setActivating(null)
+    }
+  }
+
+  // Promotion is a request for a decision, not an instruction to ship. The
+  // gate scores the run against thresholds fixed before training and answers
+  // PROMOTE or REJECT; only a PROMOTE registers the run and switches the
+  // served model. The verdict is rendered either way, so a refusal shows the
+  // rule that produced it instead of failing silently.
+  const handlePromote = async (runId, metricsAfter) => {
+    setPromoting(runId)
+    setVerdict(null)
+    try {
+      const res = await fetch(`${API}/training/promote/${runId}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ metrics_after: metricsAfter || null }),
+      })
+      const data = await res.json()
+      if (!res.ok && !data.verdict) throw new Error(data.detail || res.statusText)
+      setVerdict(data)
+      if (data.promoted) {
+        await loadRuns()
+        await loadCurrentModel()
+        await loadServingModels()
+      }
+    } catch (e) {
+      alert(`Gate evaluation failed: ${e.message}`)
     } finally {
       setPromoting(null)
     }
@@ -424,6 +472,94 @@ function RunsTab() {
     <div style={{ padding: '16px 20px', overflow: 'auto', height: '100%' }}>
 
       {/* Current Production */}
+      {view === 'runs' && (<>
+      {/* Promotion-gate verdict.
+          Promotion is not a button that ships a model: it is a request for a
+          decision. The gate answers, and the answer is shown here with the
+          rule that produced it -- including when it refuses. */}
+      {verdict && (
+        <div style={{
+          background: verdict.verdict === 'PROMOTE'
+            ? 'rgba(16,185,129,0.07)' : 'rgba(239,68,68,0.07)',
+          border: `1px solid ${verdict.verdict === 'PROMOTE'
+            ? 'rgba(16,185,129,0.35)' : 'rgba(239,68,68,0.35)'}`,
+          borderRadius: 8, padding: '14px 16px', marginBottom: 16,
+        }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 4 }}>
+            <span style={{
+              fontSize: '0.72rem', fontWeight: 800, letterSpacing: '.06em',
+              color: verdict.verdict === 'PROMOTE' ? '#10b981' : '#ef4444',
+            }}>
+              GATE: {verdict.verdict}
+            </span>
+            <span style={{ fontSize: '0.64rem', opacity: 0.55, fontFamily: 'var(--font-mono)' }}>
+              n = {verdict.n_measurable}
+            </span>
+            {verdict.promoted && (
+              <span style={{
+                background: '#10b981', color: '#fff', padding: '1px 8px',
+                borderRadius: 999, fontSize: '0.58rem', fontWeight: 700,
+              }}>
+                SERVING {verdict.activated}
+              </span>
+            )}
+          </div>
+
+          <div style={{ fontSize: '0.7rem', opacity: 0.75, marginBottom: 10, lineHeight: 1.5 }}>
+            {verdict.reason}
+          </div>
+
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
+            {[
+              ['PRIMARY',   'golden-passage recall', verdict.metrics?.primary,   true],
+              ['SECONDARY', 'fabrication rate',      verdict.metrics?.secondary, false],
+              ['GUARD',     'refusal rate',          verdict.metrics?.guard,     false],
+              ['MECHANISM', 'quote grounding',       verdict.metrics?.mechanism, false],
+            ].map(([role, label, m, withSigma]) => m && (
+              <div key={role} style={{
+                display: 'grid',
+                gridTemplateColumns: '84px 1fr 128px 74px',
+                alignItems: 'center', fontSize: '0.66rem',
+                fontFamily: 'var(--font-mono)',
+              }}>
+                <span style={{ color: '#3b82f6', fontWeight: 700 }}>{role}</span>
+                <span style={{ opacity: 0.7 }}>{label}</span>
+                <span style={{ opacity: 0.85 }}>
+                  {Number(m.before).toFixed(1)}% → {Number(m.after).toFixed(1)}%
+                </span>
+                <span style={{
+                  textAlign: 'right', fontWeight: 700,
+                  color: m.delta_pts > 0 ? '#10b981' : '#9ca3af',
+                }}>
+                  {m.delta_pts > 0 ? '+' : ''}{Number(m.delta_pts).toFixed(1)} pts
+                  {withSigma && m.sigma != null && (
+                    <span style={{
+                      marginLeft: 6,
+                      color: m.sigma >= (verdict.thresholds?.min_sigma ?? 2)
+                        ? '#10b981' : '#ef4444',
+                    }}>
+                      {Number(m.sigma).toFixed(1)} SE
+                    </span>
+                  )}
+                </span>
+              </div>
+            ))}
+          </div>
+
+          <div style={{
+            fontSize: '0.6rem', opacity: 0.45, marginTop: 9,
+            fontFamily: 'var(--font-mono)',
+          }}>
+            thresholds fixed before training · min {verdict.thresholds?.min_sigma} SE ·
+            refusal ≤ +{verdict.thresholds?.refusal_degenerate_pts} pts ·
+            fabrication ≤ +{verdict.thresholds?.fabrication_tolerance_pts} pts
+          </div>
+        </div>
+      )}
+
+      </>)}
+
+      {view === 'serving' && (<>
       <SectionTitle>Active Production Model</SectionTitle>
       {currentModel?.active ? (
         <div style={{
@@ -446,6 +582,61 @@ function RunsTab() {
         </div>
       )}
 
+      {/* Serving model — attach / detach a trained adapter */}
+      <SectionTitle>Serving Model</SectionTitle>
+      <div style={{ marginBottom: 16 }}>
+        {serving?.models?.length ? (
+          <>
+            <div style={{ fontSize: '0.68rem', opacity: 0.55, marginBottom: 8 }}>
+              A trained adapter is served as <code>FROM {serving.boot_default} + ADAPTER</code>.
+              Switching changes the weights only — prompts and decoding parameters are unchanged.
+            </div>
+            {serving.models.filter(m => !m.name.includes('-cloud')).map(m => (
+              <div key={m.name} style={{
+                display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                background: m.active ? 'rgba(16,185,129,0.08)' : 'var(--bg-secondary)',
+                border: m.active ? '1px solid rgba(16,185,129,0.25)' : '1px solid transparent',
+                borderRadius: 8, padding: '8px 12px', marginBottom: 6,
+              }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <span style={{
+                    fontWeight: m.active ? 700 : 500, fontSize: '0.74rem',
+                    color: m.active ? '#10b981' : 'var(--text-primary)',
+                  }}>{m.name}</span>
+                  {m.is_adapter && <Chip label="adapter" value="LoRA" />}
+                  {m.size && <Chip label="size" value={`${(m.size / 1e9).toFixed(1)} GB`} />}
+                </div>
+                {m.active ? (
+                  <span style={{ fontSize: '0.68rem', color: '#10b981', fontWeight: 700 }}>ACTIVE</span>
+                ) : (
+                  <button
+                    onClick={() => handleActivate(m.name)}
+                    disabled={!!activating}
+                    style={{
+                      background: 'var(--accent)', color: '#fff', border: 'none',
+                      borderRadius: 6, padding: '4px 12px', fontSize: '0.68rem',
+                      fontWeight: 600, cursor: activating ? 'wait' : 'pointer',
+                      opacity: activating ? 0.5 : 1,
+                    }}>
+                    {activating === m.name ? 'Activating…' : 'Activate'}
+                  </button>
+                )}
+              </div>
+            ))}
+          </>
+        ) : (
+          <div style={{
+            background: 'var(--bg-secondary)', borderRadius: 8, padding: 12,
+            fontSize: '0.72rem', opacity: 0.6,
+          }}>
+            {serving?.error ? `Ollama unreachable — ${serving.error}` : 'Loading models…'}
+          </div>
+        )}
+      </div>
+
+      </>)}
+
+      {view === 'runs' && (<>
       {/* Run History */}
       <SectionTitle>Training Runs ({runs.length})</SectionTitle>
       {runs.length === 0 ? (
@@ -486,7 +677,7 @@ function RunsTab() {
                     disabled={promoting === run.run_id}
                     className="tp-btn tp-btn-sm"
                   >
-                    {promoting === run.run_id ? '...' : 'Promote'}
+                    {promoting === run.run_id ? 'Gating…' : 'Promote'}
                   </button>
                 )}
               </div>
@@ -509,6 +700,7 @@ function RunsTab() {
           ))}
         </div>
       )}
+      </>)}
     </div>
   )
 }
@@ -530,7 +722,8 @@ export default function TrainingPanel() {
       }}>
         {[
           { key: 'pipeline', label: 'Pipeline' },
-          { key: 'runs',     label: 'Runs' },
+          { key: 'runs',     label: 'MLflow Runs' },
+          { key: 'serving',  label: 'Serving' },
         ].map(t => (
           <button
             key={t.key}
@@ -551,7 +744,8 @@ export default function TrainingPanel() {
       {/* Tab content */}
       <div style={{ flex: 1, overflow: 'hidden' }}>
         {tab === 'pipeline' && <PipelineTab />}
-        {tab === 'runs'     && <RunsTab />}
+        {tab === 'runs'     && <RunsTab view="runs" />}
+        {tab === 'serving'  && <RunsTab view="serving" />}
       </div>
     </div>
   )
