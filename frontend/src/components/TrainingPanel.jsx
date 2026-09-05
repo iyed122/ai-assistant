@@ -562,7 +562,15 @@ function RunsTab({ view = 'runs' }) {
       </>)}
 
       {view === 'serving' && (<>
-      <SectionTitle>Active Production Model</SectionTitle>
+      {/* Two different things, and conflating them reads as a contradiction.
+          This band reports the MLflow REGISTRY: which adapter version, if any,
+          has been transitioned to the Production stage -- which happens only
+          when the gate returns PROMOTE. The band below reports what Ollama is
+          actually serving right now, which an operator can also switch by hand
+          for evaluation. An adapter can therefore be serving while the registry
+          holds nothing, and that is not an inconsistency: it is a candidate
+          under test that the gate has not cleared. */}
+      <SectionTitle>MLflow registry — Production stage</SectionTitle>
       {currentModel?.active ? (
         <div style={{
           background: 'rgba(16,185,129,0.08)', border: '1px solid rgba(16,185,129,0.25)',
@@ -580,7 +588,9 @@ function RunsTab({ view = 'runs' }) {
           background: 'var(--bg-secondary)', borderRadius: 8, padding: 12,
           marginBottom: 16, fontSize: '0.72rem', opacity: 0.6,
         }}>
-          No trained adapter active — using base Ollama model
+          No adapter has been promoted to Production — the registry is empty.
+          Whatever is marked ACTIVE below is serving as a candidate, not as a
+          gate-cleared release.
         </div>
       )}
 

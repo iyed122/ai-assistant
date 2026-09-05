@@ -2,7 +2,7 @@
 
 A production-style, fully local enterprise assistant that answers engineering questions from **two sources at once**: a Neo4j knowledge graph built from Jira/Confluence/GitLab exports (vector + multi-hop graph retrieval), and the **live** GitLab/Jira/Confluence APIs. A LangGraph agent routes each question, a local LLM (Ollama) synthesizes the answer, and an evaluation pipeline ("Hammer") scores every response, mines training data from its own verdicts, and **gates** fine-tuned adapter deployments.
 
-Everything runs locally: Neo4j, MongoDB, Ollama, and RAFT fine-tuning on QLoRA adapters sized for a 6 GB consumer GPU.
+Everything runs locally: Neo4j, MongoDB, Ollama, retrieval, scoring, dataset export and the promotion gate all sit on a 6 GB consumer GPU. RAFT training uses QLoRA adapters — 4-bit base weights, 0.92% of parameters trainable — and the delivered 8B run itself was executed on a rented T4, with only its adapter returned and served locally.
 
 ## Architecture
 

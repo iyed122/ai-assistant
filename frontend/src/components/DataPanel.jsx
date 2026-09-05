@@ -1,21 +1,24 @@
 import { useState, useEffect } from 'react'
 
 /**
- * DataPanel — Training Data Management
+ * DataPanel — the RAFT training pool
  *
- * Two tabs:
- *   DPO  — shows dpo_rejected records, split-pane with chosen-half editor
- *   QLoRA — shows filtered GOLD candidates, excluded records, export
+ * Shows the answers the evaluator graded GOLD with no failure tag: the pool
+ * `export_raft` draws its training examples from. Records excluded by an
+ * export criterion are listed separately with the reason, and can be restored.
  *
- * MongoDB recommendation:
- *   knowledge_base.chat_history    — source of truth (unchanged)
- *   knowledge_base.dpo_candidates  — chosen halves, curated status
- *   QLoRA candidates are derived from chat_history on the fly (no new collection)
+ * Data source:
+ *   knowledge_base.chat_history — source of truth; candidates are derived from
+ *   it on the fly, so there is no second collection to keep in step.
  *
- * Backend endpoints needed:
- *   GET  /training/dpo/candidates                   → { candidates: [...] }
- *   PUT  /training/dpo/candidates/:id/chosen        → { chosen: "..." }
- *   GET  /training/qlora/candidates                 → { candidates: [...], excluded: [...] }
+ * Backend endpoint:
+ *   GET    /training/qlora/candidates              → { candidates, excluded }
+ *   DELETE /training/qlora/candidates/:id          → exclude one by hand
+ *   POST   /training/qlora/candidates/:id/restore  → undo that
+ *
+ * The route keeps its historical `qlora` path: QLoRA is still the parameter
+ * substrate every adapter here is built on, and the pool it serves is the same
+ * one. Only the training objective changed.
  */
 
 const API = ''
@@ -90,190 +93,7 @@ function exportJSONL(records, filename) {
   URL.revokeObjectURL(url)
 }
 
-// ── DPO Panel ─────────────────────────────────────────────────────────────────
-
-function DPOPanel() {
-  const [records,    setRecords]    = useState([])
-  const [loading,    setLoading]    = useState(true)
-  const [error,      setError]      = useState(null)
-  const [selectedId, setSelectedId] = useState(null)
-  const [chosen,     setChosen]     = useState('')
-  const [saving,     setSaving]     = useState(false)
-  const [saved,      setSaved]      = useState(false)
-  const [filter,     setFilter]     = useState('all')  // all | pending | curated | hallucination | tool_misuse
-
-  useEffect(() => {
-    fetch(`${API}/training/dpo/candidates`)
-      .then(r => { if (!r.ok) throw new Error(r.status); return r.json() })
-      .then(d => { setRecords(d.candidates || []); setLoading(false) })
-      .catch(() => {
-        setError('Could not reach GET /training/dpo/candidates — add this endpoint to your backend.')
-        setLoading(false)
-      })
-  }, [])
-
-  const selected = records.find(r => r.id === selectedId)
-
-  // Sync chosen text when selection changes
-  useEffect(() => {
-    if (selected) { setChosen(selected.chosen || ''); setSaved(false) }
-  }, [selectedId])
-
-  const saveChosen = async () => {
-    if (!selectedId || chosen.trim().length < 50) return
-    setSaving(true)
-    try {
-      const res = await fetch(`${API}/training/dpo/candidates/${selectedId}/chosen`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ chosen: chosen.trim() }),
-      })
-      if (!res.ok) throw new Error(res.status)
-      setRecords(prev => prev.map(r =>
-        r.id === selectedId ? { ...r, chosen: chosen.trim(), curated: true } : r
-      ))
-      setSaved(true)
-    } catch { alert('Failed to save — check the backend endpoint.') }
-    setSaving(false)
-  }
-
-  const filtered = records.filter(r => {
-    if (filter === 'pending')       return !r.curated
-    if (filter === 'curated')       return r.curated
-    if (filter === 'hallucination') return (r.failure_tags || []).includes('hallucination')
-    if (filter === 'tool_misuse')   return (r.failure_tags || []).includes('tool_misuse')
-    return true
-  })
-
-  const curated = records.filter(r => r.curated).length
-  const pending  = records.length - curated
-
-  const handleExport = () => {
-    const pairs = records
-      .filter(r => r.chosen && r.chosen.trim().length >= 50)
-      .map(r => ({ prompt: r.query, rejected: r.rejected, chosen: r.chosen }))
-    exportJSONL(pairs, 'dpo_train.jsonl')
-  }
-
-  return (
-    <div className="dp-split">
-      {/* ── Left: list ── */}
-      <div className="dp-list-pane">
-        <div className="dp-stats-row">
-          <StatChip value={records.length} label="total" />
-          <StatChip value={curated}  label="curated"  color="var(--intent-rag)" />
-          <StatChip value={pending}  label="pending"  color="var(--intent-both)" />
-          <button className="dp-export-btn" onClick={handleExport} disabled={curated === 0}>
-            Export JSONL
-          </button>
-        </div>
-
-        <div className="dp-filter-row">
-          {[
-            { key: 'all',           label: 'All' },
-            { key: 'pending',       label: 'Pending' },
-            { key: 'curated',       label: 'Curated' },
-            { key: 'hallucination', label: 'Hallucination' },
-            { key: 'tool_misuse',   label: 'Tool Misuse' },
-          ].map(f => (
-            <FilterPill key={f.key} label={f.label} active={filter === f.key} onClick={() => setFilter(f.key)} />
-          ))}
-        </div>
-
-        {loading && <div className="dp-state-msg">Loading candidates…</div>}
-        {error   && <div className="dp-error">{error}</div>}
-
-        <div className="dp-candidate-list">
-          {filtered.map(r => (
-            <button
-              key={r.id}
-              className={`dp-candidate-item ${selectedId === r.id ? 'active' : ''} ${r.curated ? 'curated' : ''}`}
-              onClick={() => setSelectedId(r.id)}
-            >
-              <div className="dp-candidate-row">
-                <span className={r.curated ? 'dp-dot-curated' : 'dp-dot-pending'}>
-                  {r.curated ? '✓' : '○'}
-                </span>
-                <div className="dp-candidate-tags">
-                  {(r.failure_tags || []).map(t => <Tag key={t} label={t} />)}
-                </div>
-                <IntentPill intent={r.intent} />
-              </div>
-              <div className="dp-candidate-query">{r.query}</div>
-              <div className="dp-candidate-meta">
-                score {r.weighted_score?.toFixed(3)} · faith {r.faithfulness?.toFixed(2)}
-              </div>
-            </button>
-          ))}
-          {!loading && !error && filtered.length === 0 && (
-            <div className="dp-state-msg">No records match this filter.</div>
-          )}
-        </div>
-      </div>
-
-      {/* ── Right: editor ── */}
-      <div className="dp-editor-pane">
-        {!selected ? (
-          <div className="dp-editor-empty">
-            <div className="dp-editor-empty-icon">📋</div>
-            <p>Select a candidate to review its rejected answer and write the correct chosen half.</p>
-            <p style={{ fontSize: '0.78rem', marginTop: '0.5rem' }}>
-              Priority: <strong>hallucination</strong> cases first — the correct answer is structurally clear:<br />
-              acknowledge the ticket was not found, state what IS available, suggest where to look.
-            </p>
-          </div>
-        ) : (
-          <>
-            <div className="dp-section">
-              <div className="dp-section-label">Query</div>
-              <div className="dp-query-box">{selected.query}</div>
-            </div>
-
-            <div className="dp-section">
-              <div className="dp-section-label" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                <span>Rejected Answer</span>
-                <div style={{ display: 'flex', gap: '0.35rem' }}>
-                  {(selected.failure_tags || []).map(t => <Tag key={t} label={t} />)}
-                </div>
-              </div>
-              {selected.failure_reason && (
-                <div className="dp-failure-reason">{selected.failure_reason}</div>
-              )}
-              <div className="dp-rejected-box">{selected.rejected}</div>
-            </div>
-
-            <div className="dp-section dp-section-grow">
-              <div className="dp-section-label">
-                Chosen Answer
-                <span className="dp-section-note">— never copy from the base model</span>
-              </div>
-              <textarea
-                className="dp-chosen-textarea"
-                placeholder={`Write the correct answer here.\n\nFor hallucination: "Ticket ${selected.query?.match(/[A-Z]{2,5}-\d+/)?.[0] || 'X'} was not found in the retrieved data. The closest available information is [...]"\n\nFor tool_misuse: cite the retrieved key explicitly and use its content.`}
-                value={chosen}
-                onChange={e => { setChosen(e.target.value); setSaved(false) }}
-              />
-              <div className="dp-chosen-footer">
-                <span className={`dp-char-count ${chosen.length > 0 && chosen.length < 50 ? 'warn' : ''}`}>
-                  {chosen.length} chars{chosen.length > 0 && chosen.length < 50 ? ' · min 50' : ''}
-                </span>
-                <button
-                  className={`dp-save-btn ${saved ? 'saved' : ''}`}
-                  onClick={saveChosen}
-                  disabled={saving || chosen.trim().length < 50}
-                >
-                  {saving ? 'Saving…' : saved ? '✓ Saved' : 'Save chosen half'}
-                </button>
-              </div>
-            </div>
-          </>
-        )}
-      </div>
-    </div>
-  )
-}
-
-// ── QLoRA Panel ───────────────────────────────────────────────────────────────
+// ── RAFT candidate pool ───────────────────────────────────────────────────────
 
 const EXCLUSION_LABELS = {
   no_live_sentries:                   'no live sentries data',
@@ -282,7 +102,7 @@ const EXCLUSION_LABELS = {
   manually_excluded:                  'manually excluded',
 }
 
-function QLoRAPanel() {
+function RaftCandidatesPanel() {
   const [candidates, setCandidates] = useState([])
   const [excluded,   setExcluded]   = useState([])
   const [loading,    setLoading]    = useState(true)
@@ -314,7 +134,7 @@ function QLoRAPanel() {
 
   const handleExport = () => {
     const rows = shown.map(c => ({ instruction: c.query, input: '', output: c.answer }))
-    exportJSONL(rows, `qlora_${filter === 'all' ? 'train' : filter}.jsonl`)
+    exportJSONL(rows, `raft_candidates_${filter === 'all' ? 'train' : filter}.jsonl`)
   }
 
   const handleDelete = async (id) => {
@@ -487,34 +307,34 @@ function QLoRAPanel() {
 
 // ── Main DataPanel ─────────────────────────────────────────────────────────────
 
+// The RAFT training pool is the GOLD pool: answers the evaluator graded GOLD,
+// with no failure tag, are what `export_raft` turns into training examples.
+//
+// An earlier rename relabelled the tabs without moving the panels, so the tab
+// reading "RAFT Candidates" rendered the preference-rejection pool
+// (training_signal == "dpo_rejected") -- the opposite of what RAFT trains on --
+// while the GOLD pool sat under "Scored Answers". Preference tuning is no
+// longer a method here, so that panel and its curation editor are gone and the
+// GOLD pool is what the view shows.
 export default function DataPanel() {
-  const [tab, setTab] = useState('dpo')
-
   return (
     <div className="data-panel">
       <div className="dp-header">
         <div className="dp-header-left">
           <span className="dp-title">Training Data</span>
           <div className="dp-tabs">
-            <button className={`dp-tab ${tab === 'dpo' ? 'active' : ''}`} onClick={() => setTab('dpo')}>
-              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                <circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/>
-                <line x1="9" y1="9" x2="15" y2="15"/>
-              </svg>
-              RAFT Candidates
-            </button>
-            <button className={`dp-tab ${tab === 'qlora' ? 'active' : ''}`} onClick={() => setTab('qlora')}>
+            <button className="dp-tab active">
               <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                 <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>
               </svg>
-              Scored Answers
+              RAFT Candidates
             </button>
           </div>
         </div>
       </div>
 
       <div className="dp-content">
-        {tab === 'dpo' ? <DPOPanel /> : <QLoRAPanel />}
+        <RaftCandidatesPanel />
       </div>
     </div>
   )

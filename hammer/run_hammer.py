@@ -8,7 +8,8 @@ production — never touches the LangGraph inference graph.
 Commands:
   score        — Run the evaluator on all unscored chat_history docs
   check        — Rolling quality check (alerts if score regresses)
-  dataset      — Export training datasets (raft / qlora / dpo / grpo / seed / all)
+  dataset      — Export training datasets (raft is the active objective;
+                 qlora / dpo / grpo exporters are retained for comparison)
   benchmark    — Run the adapter gate benchmark before deployment
   deploy       — Mark a version as deployed in model_versions
   status       — Print full system status (scores, dataset readiness, versions)
@@ -222,12 +223,19 @@ def cmd_status(args) -> None:
         for t, n in sorted(stats.get("failure_tags", {}).items(), key=lambda x: -x[1]):
             critical = " [CRITICAL]" if t in ("hallucination", "tool_misuse", "retrieval_miss") else ""
             print(f"    {t:<18} : {n:>4}{critical}")
+        # The RAFT training pool is the GOLD pool: `export_raft` draws its
+        # examples from answers graded GOLD with no failure tag.
+        #
+        # The stored training_signal values are still spelled qlora_positive /
+        # dpo_rejected -- they are written into MongoDB documents going back to
+        # the start of the project, and renaming them would mean rewriting the
+        # audit trail. They are reported here under what they mean rather than
+        # what they are called, so the console does not name a training
+        # objective this project no longer uses.
         print(f"\n  Training-data pool:")
-        print(f"    QLoRA (GOLD)       : {grades.get('GOLD', 0)}")
-        print(f"    DPO candidates     : {stats['dpo_pending_review']}")
-        print(f"\n  Legacy (training_signal, backward-compat):")
-        print(f"    qlora_positive     : {stats['qlora_ready']}")
-        print(f"    dpo_rejected       : {stats['dpo_ready']}")
+        print(f"    RAFT pool (GOLD)   : {grades.get('GOLD', 0)}")
+        print(f"    quarantined        : {stats['dpo_ready']}")
+        print(f"    eligible, unscored : {stats['dpo_pending_review']}")
     except Exception as e:
         print(f"\n  Dataset stats failed: {e}")
 
