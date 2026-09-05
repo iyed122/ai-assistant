@@ -113,24 +113,31 @@ def main() -> None:
 
     ax.text(25.0, 85.0, "Ingestion pipeline", ha="center", fontsize=10.5,
             fontweight="bold", color=INK)
-    ing = [
-        box(ax, 17.0, 79.9, 16, 3.6, "1 · Ingest", BLUE_F, BLUE_E),
-        box(ax, 17.0, 76.0, 16, 3.6, "2 · Normalize", BLUE_F, BLUE_E),
-        box(ax, 17.0, 72.1, 16, 3.6, "3 · Chunk", BLUE_F, BLUE_E),
-        box(ax, 17.0, 68.2, 16, 3.6, "4 · Embed\narctic-embed-m · 768d",
-            BLUE_F, BLUE_E, fs=8.2),
-    ]
+    # Stage boxes need a real gap between them, otherwise the connecting arrow
+    # has under half a unit to draw in and renders as a stub sitting on the box
+    # edges. Height 3.4 on a 4.4 pitch leaves a full unit of clear space.
+    ing = []
+    for k, (txt, fs) in enumerate([
+            ("1 · Ingest", 10.5),
+            ("2 · Normalize", 10.5),
+            ("3 · Chunk", 10.5),
+            ("4 · Embed\narctic-embed-m · 768d", 8.2)]):
+        ing.append(box(ax, 17.0, 80.2 - k * 4.4, 16, 3.4, txt, BLUE_F, BLUE_E, fs=fs))
     for a, b in zip(ing, ing[1:]):
-        arrow(ax, (a[0] + a[2] / 2, a[1]), (b[0] + b[2] / 2, b[1] + b[3]), BLUE_E, lw=1.5)
-    arrow(ax, (13.5, 76.7), (17.0, 78.5), GREY_E, lw=1.5)
+        cx = a[0] + a[2] / 2
+        arrow(ax, (cx, a[1]), (cx, b[1] + b[3]), BLUE_E, lw=1.5)
+    # Into stage 1, not into the side of stage 2.
+    arrow(ax, (13.5, 76.7), (16.8, 81.2), GREY_E, lw=1.5, rad=-0.12)
 
     ax.text(44.0, 85.0, "Knowledge stores", ha="center", fontsize=10.5,
             fontweight="bold", color=INK)
     mongo = box(ax, 36.0, 78.4, 16, 5.2, "MongoDB\nsource of truth", TEAL_F, TEAL_E)
     neo = box(ax, 36.0, 70.0, 16, 5.2, "Neo4j\ngraph + vector index", TEAL_F, TEAL_E)
-    arrow(ax, (33.0, 78.0), (36.0, 80.0), BLUE_E, rad=-0.15)
+    # The pipeline writes to MongoDB; neo4j_import loads the graph from there.
+    arrow(ax, (33.0, 81.9), (36.0, 81.0), BLUE_E, rad=-0.12)
     arrow(ax, (44.0, 78.4), (44.0, 75.2), TEAL_E, lw=1.5)
-    label(ax, 47.6, 76.8, "neo4j_import", TEAL_E, fs=8)
+    ax.text(45.2, 76.8, "neo4j_import", ha="left", va="center", fontsize=8,
+            style="italic", color=TEAL_E, zorder=6)
 
     ax.add_patch(FancyBboxPatch(
         (55.0, 62.5), 43.0, 24.0, boxstyle="round,pad=0,rounding_size=1.2",
@@ -149,7 +156,6 @@ def main() -> None:
     arrow(ax, (66.0, 72.0), (66.0, 69.4), GRN_E, lw=1.5)
     arrow(ax, (86.0, 72.0), (80.0, 69.4), GRN_E, lw=1.5)
     arrow(ax, (52.0, 72.6), (58.0, 74.5), TEAL_E, rad=0.12)
-    label(ax, 55.4, 74.6, "retrieval", TEAL_E, fs=8)
 
     answer = box(ax, 70.0, 52.0, 25.0, 4.4, "Answer  →  user   (streamed)",
                  GRN_F, GRN_E, fs=10.5)
@@ -172,7 +178,7 @@ def main() -> None:
     dataset = box(ax, 34.0, 36.0, 20.0, 5.4,
                   "RAFT dataset\ngolden passage + distractors", AMB_F, AMB_E, fs=9.5)
     arrow(ax, (57.0, 38.7), (54.0, 38.7), AMB_E)
-    label(ax, 55.5, 41.6, "GOLD only", "#b45309", fs=8)
+    label(ax, 55.5, 42.6, "GOLD only", "#b45309", fs=8)
 
     train = box(ax, 12.0, 36.0, 19.0, 5.4,
                 "Training  ·  RAFT objective\nQLoRA 4-bit adapter", PUR_F, PUR_E, fs=9.5)
@@ -181,7 +187,7 @@ def main() -> None:
     mlflow = box(ax, 12.0, 27.0, 19.0, 5.0, "MLflow  ·  tracking + registry",
                  PUR_F, PUR_E, fs=9.5)
     arrow(ax, (21.5, 36.0), (21.5, 32.0), PUR_E, lw=1.6)
-    label(ax, 26.6, 34.0, "log runs", PUR_E, fs=8)
+    label(ax, 25.5, 34.0, "log runs", PUR_E, fs=8)
 
     # The two arms. This is what the gate reads, and the reason the comparison
     # means anything: identical server, identical quantisation, one difference.
@@ -198,14 +204,13 @@ def main() -> None:
                "deterministic — no LLM judge",
                "#fff7ed", "#c2410c", fs=8.8)
     arrow(ax, (56.0, 29.5), (62.0, 29.5), AMB_E)
-    ax.text(70.0, 22.9, "thresholds fixed before training", ha="center",
+    ax.text(64.0, 22.9, "thresholds fixed before training", ha="center",
             fontsize=8.2, style="italic", color="#9a3412", zorder=6)
 
     # Both outcomes. A gate drawn with only its success branch is a pipeline.
     reject = box(ax, 66.0, 12.0, 22.0, 4.6,
                  "REJECT  →  incumbent stays live", RED_F, RED_E, fs=9.5, tc="#b91c1c")
     arrow(ax, (77.0, 24.6), (77.0, 16.6), RED_E, lw=1.7)
-    label(ax, 83.6, 20.4, "verdict recorded", RED_E, fs=8)
 
     export = box(ax, 11.0, 12.0, 25.0, 5.6,
                  "PROMOTE  →  export_to_ollama\nadapter merged into the served model",
